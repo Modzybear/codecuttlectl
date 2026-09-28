@@ -8,9 +8,9 @@ import (
 	"os"
 	"strings"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
 )
 
 type listDirTool struct{}

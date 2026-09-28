@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 func TestConverse_Basic(t *testing.T) {

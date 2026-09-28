@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/codecuttle/codecuttlectl/internal/session"
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // TurnStatus describes the final execution outcome, independently of event delivery.

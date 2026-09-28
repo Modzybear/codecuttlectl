@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
 )
 
 // --- Trigger Parsing Tests ---

@@ -7,7 +7,7 @@ import (
 	"image/color"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/visualtest"
+	"github.com/Modzybear/codecuttlectl/internal/visualtest"
 )
 
 // makeImage creates a solid-color test image.

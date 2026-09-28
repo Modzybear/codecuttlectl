@@ -10,7 +10,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // Client implements provider.Provider for Ollama local models.

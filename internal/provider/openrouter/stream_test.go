@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 func collectStream(t *testing.T, data string) []provider.StreamEvent {

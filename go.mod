@@ -1,4 +1,4 @@
-module github.com/codecuttle/codecuttlectl
+module github.com/Modzybear/codecuttlectl
 
 go 1.25.0
 

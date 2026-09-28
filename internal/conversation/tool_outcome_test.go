@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
-	"github.com/codecuttle/codecuttlectl/internal/swarm"
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 func TestBuiltinOutcomes(t *testing.T) {

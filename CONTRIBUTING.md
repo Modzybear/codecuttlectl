@@ -42,8 +42,8 @@ package main
 
 import (
     "context"
-    pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit"
+    pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit"
 )
 
 type myTool struct{}

@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 const (

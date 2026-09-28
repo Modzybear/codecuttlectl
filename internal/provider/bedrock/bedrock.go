@@ -4,8 +4,8 @@ package bedrockprov
 import (
 	"context"
 
-	"github.com/codecuttle/codecuttlectl/internal/bedrock"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/bedrock"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // Provider wraps a bedrock.Client to implement provider.Provider.

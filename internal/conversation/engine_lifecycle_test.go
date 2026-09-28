@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // barrierProvider enters synchronously but delegates waiting to the stream

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 )
 
 // Advice represents the reconciler's recommendation for the next model call.

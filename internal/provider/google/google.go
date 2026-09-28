@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 	"google.golang.org/genai"
 )
 

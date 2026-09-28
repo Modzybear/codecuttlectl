@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/audit"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/audit"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // Exercise the actual executable and gRPC boundary, not a fake ExecuteResponse.

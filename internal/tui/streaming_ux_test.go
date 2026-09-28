@@ -7,7 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 )
 
 func TestWrapTextPreservesANSIAndUnicode(t *testing.T) {

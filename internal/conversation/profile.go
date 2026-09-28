@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
-	"github.com/codecuttle/codecuttlectl/internal/prompt"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/swarm"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/prompt"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 )
 
 // NodeProfile is the fully resolved runtime identity of one swarm node: which

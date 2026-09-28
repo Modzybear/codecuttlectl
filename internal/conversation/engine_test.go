@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 type mockEchoProvider struct{}

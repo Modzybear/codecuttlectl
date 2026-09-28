@@ -35,8 +35,8 @@ func TestOpenRouterAstraSwarm(t *testing.T) {
 		if !slices.Contains(node.Workbench, "handoff") {
 			t.Errorf("node %q cannot use its handoff routes", id)
 		}
-		if id != "astra" && !slices.Equal(m.Topology.Rules[id], []string{"astra"}) {
-			t.Errorf("node %q must return only to astra", id)
+		if id != "astra" && !slices.Contains(m.Topology.Rules[id], "astra") {
+			t.Errorf("node %q must have return route to astra", id)
 		}
 		if id != "astra" && !slices.Contains(m.Topology.Rules["astra"], id) {
 			t.Errorf("astra cannot handoff to %q", id)

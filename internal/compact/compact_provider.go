@@ -10,7 +10,7 @@ package compact
 import (
 	"fmt"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // CompactProvider rewrites old tool_result blocks in provider message history with

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
 	"google.golang.org/grpc"
 )
 

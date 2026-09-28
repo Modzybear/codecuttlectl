@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // ProviderFactory is a function that can create a provider given its node configuration and context.

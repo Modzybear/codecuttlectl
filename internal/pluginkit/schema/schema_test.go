@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/types"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/types"
 )
 
 // testSimpleInput mimics a basic plugin input struct.

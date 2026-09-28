@@ -25,10 +25,10 @@ import (
 	"github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 
-	"github.com/codecuttle/codecuttlectl/internal/bedrock"
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	pluginschema "github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
-	"github.com/codecuttle/codecuttlectl/internal/skills"
+	"github.com/Modzybear/codecuttlectl/internal/bedrock"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	pluginschema "github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
+	"github.com/Modzybear/codecuttlectl/internal/skills"
 )
 
 // Handshake is the shared handshake config between host and plugins.

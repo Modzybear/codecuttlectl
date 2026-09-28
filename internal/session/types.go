@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // SessionMeta is the lightweight metadata shown in session listings.

@@ -52,7 +52,7 @@ Uses a `command` field to dispatch (similar to how `git` uses `subcommand`):
 ```json
 {
   "command": "pr_create",
-  "owner": "codecuttle",
+  "owner": "Modzybear",
   "repo": "codecuttlectl",
   "title": "Add web search plugin",
   "head": "feat-web-search-plugin",
