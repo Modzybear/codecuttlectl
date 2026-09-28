@@ -13,7 +13,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // planPatterns are regex patterns that detect when a model is expressing a plan.

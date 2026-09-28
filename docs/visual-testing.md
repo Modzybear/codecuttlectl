@@ -346,7 +346,7 @@ package tui_test
 
 import (
     "testing"
-    "github.com/codecuttle/codecuttlectl/internal/visualtest"
+    "github.com/Modzybear/codecuttlectl/internal/visualtest"
 )
 
 func TestViewportStability(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"os"
 	"strconv"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
 )
 
 // commandOutcome is shared by unary and streaming execution. Command failures

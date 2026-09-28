@@ -14,9 +14,9 @@ import (
     "encoding/json"
     "fmt"
 
-    pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+    pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
 )
 
 type myTool struct{}
@@ -104,7 +104,7 @@ The `pluginkit/types` package provides types that handle common LLM JSON generat
 LLMs frequently emit integers as strings (`"5"` instead of `5`). `FlexInt` accepts both forms transparently:
 
 ```go
-import "github.com/codecuttle/codecuttlectl/internal/pluginkit/types"
+import "github.com/Modzybear/codecuttlectl/internal/pluginkit/types"
 
 type myInput struct {
     Timeout types.FlexInt `json:"timeout,omitempty" jsonschema_description:"Timeout in seconds"`
@@ -140,9 +140,9 @@ import (
     "context"
     "embed"
 
-    pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+    pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
 )
 
 //go:embed skills/*
@@ -183,9 +183,9 @@ import (
     "context"
     "embed"
 
-    pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+    pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
 )
 
 //go:embed skills/*
@@ -358,9 +358,9 @@ import (
     "context"
     "encoding/json"
 
-    pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit"
-    "github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+    pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit"
+    "github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
     "google.golang.org/protobuf/encoding/protojson"
 
     inputpb "cuttlebone-my-tool/inputpb"

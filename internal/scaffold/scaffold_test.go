@@ -73,7 +73,7 @@ func TestGenerate_Simple(t *testing.T) {
 	if !strings.Contains(string(gomod), "module cuttlebone-json-query") {
 		t.Error("expected module declaration in go.mod")
 	}
-	if !strings.Contains(string(gomod), "replace github.com/codecuttle/codecuttlectl") {
+	if !strings.Contains(string(gomod), "replace github.com/Modzybear/codecuttlectl") {
 		t.Error("expected replace directive in go.mod")
 	}
 }
@@ -102,7 +102,7 @@ func TestGenerate_WithFlexInt(t *testing.T) {
 	src := string(content)
 
 	// Must import types package for FlexInt
-	if !strings.Contains(src, `"github.com/codecuttle/codecuttlectl/internal/pluginkit/types"`) {
+	if !strings.Contains(src, `"github.com/Modzybear/codecuttlectl/internal/pluginkit/types"`) {
 		t.Error("expected types import for FlexInt")
 	}
 

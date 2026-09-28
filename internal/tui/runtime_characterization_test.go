@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
-	"github.com/codecuttle/codecuttlectl/internal/conversation"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
-	"github.com/codecuttle/codecuttlectl/internal/prompt"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/swarm"
+	"github.com/Modzybear/codecuttlectl/internal/conversation"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/prompt"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 )
 
 // KnownDivergence tests assert the measured baseline, NOT the desired contract.

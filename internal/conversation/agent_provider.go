@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
-	"github.com/codecuttle/codecuttlectl/internal/compact"
-	"github.com/codecuttle/codecuttlectl/internal/inkwell"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/session"
-	"github.com/codecuttle/codecuttlectl/internal/swarm"
+	"github.com/Modzybear/codecuttlectl/internal/compact"
+	"github.com/Modzybear/codecuttlectl/internal/inkwell"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 )
 
 // turnProvider implements Turn using the provider interface.

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/session"
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // EngineEvent is the sealed marker interface for domain events emitted by Engine.

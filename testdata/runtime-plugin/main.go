@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit"
 )
 
 type fixture struct{}

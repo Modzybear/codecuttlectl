@@ -11,8 +11,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
-	"github.com/codecuttle/codecuttlectl/internal/provider/openrouter"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
+	"github.com/Modzybear/codecuttlectl/internal/provider/openrouter"
 )
 
 func TestRateLimitCancelAndStaleEvents(t *testing.T) {

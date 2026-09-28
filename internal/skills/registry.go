@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
 )
 
 // DefaultBudget is the default total token budget for skill injection.

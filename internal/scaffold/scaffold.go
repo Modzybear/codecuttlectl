@@ -187,9 +187,9 @@ func renderGoMod(binaryName, modulePath string) string {
 
 go 1.25.0
 
-require github.com/codecuttle/codecuttlectl v0.0.0
+require github.com/Modzybear/codecuttlectl v0.0.0
 
-replace github.com/codecuttle/codecuttlectl => %s
+replace github.com/Modzybear/codecuttlectl => %s
 `, binaryName, modulePath)
 }
 
@@ -275,11 +275,11 @@ import (
 	"encoding/json"
 	"fmt"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
 {{- if .HasFlexInt}}
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/types"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/types"
 {{- end}}
 )
 

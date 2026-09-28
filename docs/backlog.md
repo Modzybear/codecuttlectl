@@ -334,7 +334,7 @@ Every WorkItem has an optional `project` string. When the agent proposes work, i
 ### Project Detection (layered, first match wins)
 
 1. Explicit `--project` flag or tool input parameter
-2. Git remote origin → extract repo name (e.g., `github.com/codecuttle/codecuttlectl` → `codecuttlectl`)
+2. Git remote origin → extract repo name (e.g., `github.com/Modzybear/codecuttlectl` → `codecuttlectl`)
 3. Go module path from `go.mod` → last path segment
 4. `package.json` `name` field
 5. Basename of the working directory

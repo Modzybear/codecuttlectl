@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 )
 
 // ErrorClass represents a high-level error category.

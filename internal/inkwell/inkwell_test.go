@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 )
 
 // --- Classifier Tests ---
 
 func TestClassifyGoCompileError(t *testing.T) {
-	output := `# github.com/codecuttle/codecuttlectl/internal/bedrock
+	output := `# github.com/Modzybear/codecuttlectl/internal/bedrock
 internal/bedrock/client.go:200:58: cannot use doc (variable of map type document) as "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document".Interface value`
 
 	ce := Classify("bash_exec", output, true)

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
 )
 
 func TestFromProtoDescriptor_ExecuteRequest(t *testing.T) {

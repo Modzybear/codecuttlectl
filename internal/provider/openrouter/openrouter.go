@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // Client implements provider.Provider for OpenRouter.
@@ -283,7 +283,7 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (io.ReadCloser, err
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	// OpenRouter specific App Attribution Headers
-	httpReq.Header.Set("HTTP-Referer", "https://github.com/codecuttle/codecuttlectl")
+	httpReq.Header.Set("HTTP-Referer", "https://github.com/Modzybear/codecuttlectl")
 	httpReq.Header.Set("X-OpenRouter-Title", "codecuttlectl")
 	httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
 

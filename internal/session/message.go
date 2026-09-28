@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
-	providerPkg "github.com/codecuttle/codecuttlectl/internal/provider"
+	providerPkg "github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // Message is the JSON-serializable representation of a conversation message.

@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // parseSSEStream reads Server-Sent Events from the Ollama streaming response

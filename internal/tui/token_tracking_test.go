@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
-	"github.com/codecuttle/codecuttlectl/internal/todo"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // mockBedrockProvider implements provider.Provider and provider.CostEstimator

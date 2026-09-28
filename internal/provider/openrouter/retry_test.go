@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 func TestRateLimitRecovery(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	"github.com/codecuttle/codecuttlectl/internal/pluginhost"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 )
 
 // ToolImpl is the interface that plugin authors implement.

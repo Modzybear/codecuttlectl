@@ -13,10 +13,10 @@ import (
 	"fmt"
 	"strings"
 
-	pb "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/schema"
-	"github.com/codecuttle/codecuttlectl/internal/pluginkit/types"
+	pb "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/schema"
+	"github.com/Modzybear/codecuttlectl/internal/pluginkit/types"
 )
 
 type githubPlugin struct {
@@ -27,7 +27,7 @@ type githubInput struct {
 	Command string `json:"command" jsonschema:"required,enum=pr_list,enum=pr_create,enum=pr_get,enum=pr_merge,enum=pr_close,enum=pr_comment,enum=issue_list,enum=issue_create,enum=issue_get,enum=issue_comment,enum=issue_close,enum=repo_get,enum=list_branches,enum=create_release,enum=api" jsonschema_description:"GitHub command to execute"`
 
 	// Common fields
-	Owner string `json:"owner,omitempty" jsonschema_description:"Repository owner (user or org). Defaults to 'codecuttle' if not specified."`
+	Owner string `json:"owner,omitempty" jsonschema_description:"Repository owner (user or org). Defaults to 'Modzybear' if not specified."`
 	Repo  string `json:"repo,omitempty" jsonschema_description:"Repository name. Defaults to 'codecuttlectl' if not specified."`
 
 	// PR fields
@@ -74,9 +74,9 @@ Common workflows:
 - List open PRs: github(command="pr_list")
 - Merge a PR: github(command="pr_merge", number=5, merge_method="squash")
 - Create an issue: github(command="issue_create", title="...", body="...", labels=["bug"])
-- Raw API call: github(command="api", method="GET", path="/repos/codecuttle/codecuttlectl/topics")
+- Raw API call: github(command="api", method="GET", path="/repos/Modzybear/codecuttlectl/topics")
 
-Owner defaults to "codecuttle" and repo defaults to "codecuttlectl" when not specified.
+Owner defaults to "Modzybear" and repo defaults to "codecuttlectl" when not specified.
 
 CRITICAL: PR and issue body fields must contain real markdown with actual newline characters.
 Never use literal backslash-n (\n) escape sequences in body text — they render as visible
@@ -106,7 +106,7 @@ func (p *githubPlugin) Execute(ctx context.Context, req *pb.ExecuteRequest) (*pb
 
 	// Apply defaults
 	if params.Owner == "" {
-		params.Owner = "codecuttle"
+		params.Owner = "Modzybear"
 	}
 	if params.Repo == "" {
 		params.Repo = "codecuttlectl"

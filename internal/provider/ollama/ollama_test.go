@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // testHandler wraps a handler function to also handle the /api/show probe

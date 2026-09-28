@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecuttle/codecuttlectl/internal/visualtest"
+	"github.com/Modzybear/codecuttlectl/internal/visualtest"
 )
 
 // testEnv creates a visual test environment with default settings.

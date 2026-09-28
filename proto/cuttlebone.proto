@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package cuttlebone.v1;
 
-option go_package = "github.com/codecuttle/codecuttlectl/internal/cuttlebone/v1;cuttlebonev1";
+option go_package = "github.com/Modzybear/codecuttlectl/internal/cuttlebone/v1;cuttlebonev1";
 
 // ToolPlugin is the core RPC service that every Cuttlebone plugin must implement.
 // This is the interface between the codecuttlectl orchestrator (host) and each

@@ -1,8 +1,8 @@
 package bedrockprov
 
 import (
-	"github.com/codecuttle/codecuttlectl/internal/bedrock"
-	"github.com/codecuttle/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/bedrock"
+	"github.com/Modzybear/codecuttlectl/internal/provider"
 )
 
 // PoolWrapper wraps a bedrock.ModelPool to implement the generic provider.Pool interface.
