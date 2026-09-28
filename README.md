@@ -1,6 +1,6 @@
 # codecuttlectl
 
-`codecuttlectl` (`c3`) is an autonomous CLI coding agent and meta-harness built in Go. It wraps foundation models with decoupled gRPC tool execution, real-time diagnostic feedback loops, declarative multi-agent swarm morphologies, and monotonic context caching.
+`codecuttlectl` (`c3`) is a Go-based CLI coding agent and meta-harness. It combines foundation models with isolated tool execution, diagnostics, and optional multi-agent workflows.
 
 ![codecuttlectl TUI](docs/tui-screenshot.png)
 
@@ -17,17 +17,19 @@
 ## Installation
 
 ```bash
-# Clone and build binary + plugins
+# Clone and build the CLI and bundled plugins
 git clone https://github.com/Modzybear/codecuttlectl.git
 cd codecuttlectl
 make all
 
-# Install system-wide (or symlink into PATH)
+# Run directly from the checkout
+./bin/codecuttlectl -plugin-dir ./bin/plugins
+
+# Optional: install system-wide
 sudo cp bin/codecuttlectl /usr/local/bin/codecuttlectl
 sudo mkdir -p /usr/local/lib/codecuttlectl/plugins
 sudo cp bin/plugins/* /usr/local/lib/codecuttlectl/plugins/
 
-# Convenience alias
 echo 'alias c3="codecuttlectl -plugin-dir /usr/local/lib/codecuttlectl/plugins"' >> ~/.bashrc
 source ~/.bashrc
 ```
@@ -37,13 +39,13 @@ source ~/.bashrc
 ## Quickstart
 
 ```bash
-# Interactive TUI (default provider: Bedrock Claude 3.7 / 4.6)
+# Interactive TUI
 c3
 
-# Multi-Agent Swarm Mode (declarative morphology)
-c3 --morphology testdata/openrouter-astra-swarm.yaml
+# Run the example multi-agent morphology
+c3 --morph testdata/openrouter-astra-swarm.yaml
 
-# Local Models via Ollama (auto-detected prefix or explicit flag)
+# Local models via Ollama
 c3 --model ollama:qwen3:32b
 c3 --provider ollama --model gemma4:31b
 
@@ -51,11 +53,11 @@ c3 --provider ollama --model gemma4:31b
 c3 --provider openrouter --model anthropic/claude-3.7-sonnet
 c3 --provider google --model gemini-2.5-pro
 
-# Non-interactive / Scripting / Resume
+# Non-interactive, REPL, or resume a session
 c3 -message "Fix compile errors in ./internal/provider"
-c3 -no-tui                      # Pure streaming REPL
-c3 --list-sessions              # View saved sessions and token costs
-c3 --session ses_abc123         # Resume previous session state
+c3 -no-tui
+c3 --list-sessions
+c3 --session ses_abc123
 ```
 
 ---
@@ -71,43 +73,23 @@ c3 --session ses_abc123         # Resume previous session state
 
 ---
 
-## Architecture & Morphologies
+## Architecture
 
-Named after cephalopod neurology where peripheral arm clusters solve problems locally. The orchestrator delegates tool execution to independent plugin processes and routes complex problems across specialized swarm agents.
+The harness keeps model interaction, sessions, diagnostics, and plugin execution separate:
 
-```
-                  ┌─────────────────────────────────────────┐
-                  │          codecuttlectl Engine           │
-                  │   (Sessions, History, Context Cache)    │
-                  └───────────────────┬─────────────────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-    ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
-    │  Primary / Astra  │◄─►│    Deep Coder     │◄─►│   Qwen Reviewer   │
-    │   (Coordinator)   │   │  (Implementation) │   │  (Code Reviewer)  │
-    └─────────┬─────────┘   └─────────┬─────────┘   └─────────┬─────────┘
-              │                       │                       │
-              └───────────────────────┼───────────────────────┘
-                                      ▼
-                        ┌───────────────────────────┐
-                        │   Cuttlebone gRPC Layer   │
-                        │ (read, write, bash, git…) │
-                        └───────────────────────────┘
-```
+- **Engine:** serializes turns, saves sessions, tracks usage, and coordinates streaming.
+- **Cuttlebone:** runs tools as isolated gRPC plugin processes with typed input schemas and restart handling.
+- **Inkwell and skills:** record tool outcomes and inject relevant, versioned guidance when needed.
+- **Swarm morphologies:** YAML-defined specialist nodes and permitted handoff routes. The included example uses a coordinator, implementers, and reviewers.
+- **Context compaction:** limits the size of long tool results while preserving recent work.
 
-### Core Subsystems
-
-- **Swarm Orchestration:** Dynamic multi-agent routing defined in concise YAML morphologies. Agents transition context cleanly with automated cross-provider history sanitization.
-- **Swarm Backlog:** Proactive task decomposition (`todo_manage`) distributing independent coding slices asynchronously across parallel background agents.
-- **Inkwell & Skills Registry:** Captures tool outcomes and failure patterns. Injects targeted instructions and workflows only when relevant to the active context.
-- **Context Compaction:** Heuristic summarization of long tool results keeping active context windows lean.
+See [`docs/architecture.md`](docs/architecture.md), [`docs/swarm-morphologies.md`](docs/swarm-morphologies.md), and [`docs/writing-plugins.md`](docs/writing-plugins.md).
 
 ---
 
-## Built-in & Plugin Tools
+## Tools
 
-`codecuttlectl` includes 17 tools out of the box (12 modular gRPC plugins + 5 harness built-ins):
+`codecuttlectl` includes 17 tools (12 gRPC plugins and 5 harness built-ins):
 
 - **Filesystem & Shell:** `read_file`, `write_file`, `edit_file`, `list_directory`, `glob`, `grep`, `bash_exec`
 - **Version Control & GitHub:** `git` (with destructive command safeguards), `github` (PRs, issues, comments, releases)
