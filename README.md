@@ -93,7 +93,7 @@ See [`docs/architecture.md`](docs/architecture.md), [`docs/swarm-morphologies.md
 
 - **Filesystem & Shell:** `read_file`, `write_file`, `edit_file`, `list_directory`, `glob`, `grep`, `bash_exec`
 - **Version Control & GitHub:** `git` (with destructive command safeguards), `github` (PRs, issues, comments, releases)
-- **Web & Research:** `websearch` (Exa search integration), `webfetch` (HTML to markdown/text extraction)
+- **Web & Research:** `websearch` ([Exa by default, optional Parallel search](docs/web-search.md)), `webfetch` (HTML to markdown/text extraction)
 - **Harness & Extensibility:** `todo_manage`, `tool_info`, `get_skill`, `go_skills`, `scaffold_plugin`, `reload_plugins`
 
 ---
