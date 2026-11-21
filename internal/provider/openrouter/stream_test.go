@@ -22,8 +22,10 @@ func collectStream(t *testing.T, data string) []provider.StreamEvent {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	client := New(Config{BaseURL: server.URL})
+	client.waitRetry = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 	var events []provider.StreamEvent
-	for event := range New(Config{BaseURL: server.URL}).ConverseStream(ctx, provider.Request{}) {
+	for event := range client.ConverseStream(ctx, provider.Request{}) {
 		events = append(events, event)
 	}
 	return events
@@ -86,6 +88,9 @@ func TestStreamFailuresAreNotSuccessfulTurns(t *testing.T) {
 		"unfinished tool":       sse(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"edit_file","arguments":"{"}}]},"finish_reason":"tool_calls"}]}`, `[DONE]`),
 		"tool without identity": sse(`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`, `[DONE]`),
 		"length limited tools":  sse(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"edit_file","arguments":"{}"}}]},"finish_reason":"length"}]}`, `[DONE]`),
+		"malformed response":    sse(`{"choices":[{"delta":{"content":""},"finish_reason":"stop","native_finish_reason":"MALFORMED_RESPONSE"}]}`, `[DONE]`),
+		"malformed function":    sse(`{"choices":[{"delta":{"content":""},"finish_reason":"error","native_finish_reason":"MALFORMED_FUNCTION_CALL"}]}`, `[DONE]`),
+		"finish error":          sse(`{"choices":[{"delta":{"content":""},"finish_reason":"error"}]}`, `[DONE]`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			errors := 0

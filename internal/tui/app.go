@@ -84,6 +84,8 @@ type Model struct {
 	retryUntil        time.Time
 	retryAttempt      int
 	retryMax          int
+	retryReason       string
+	streamEmitted     bool          // true if text, reasoning, or tool_start was emitted in current stream
 	streamStep        int           // Counts consecutive tool-use rounds in this turn (for grounding)
 	stateDict         *stateDict    // State dictionary for small-model grounding (nil for large models)
 	lastExecutedTools []pendingTool // Tools from the last execution (for state dict tracking)
@@ -595,6 +597,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamTextMsg:
 		m.retryUntil = time.Time{}
+		m.retryReason = ""
+		if strings.TrimSpace(msg.Text) != "" {
+			m.streamEmitted = true
+		}
 		// Clear interrupt pending on new content (user didn't confirm)
 		m.interruptPending = false
 		// If we were in reasoning, finalize it before text starts
@@ -617,6 +623,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamReasoningMsg:
 		m.retryUntil = time.Time{}
+		m.retryReason = ""
+		if strings.TrimSpace(msg.Text) != "" {
+			m.streamEmitted = true
+		}
 		m.inReasoning = true
 		m.reasoningBuf.WriteString(msg.Text)
 		m.updateViewportContent()
@@ -638,6 +648,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamToolStartMsg:
 		m.retryUntil = time.Time{}
+		m.retryReason = ""
+		m.streamEmitted = true
 		// Text emitted before a tool call is the model's internal reasoning
 		// about what to do — treat it as thinking, not as a response
 		if m.streamBuf.Len() > 0 {
@@ -685,6 +697,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StreamRetryMsg:
 		m.retryUntil = time.Now().Add(msg.Delay)
 		m.retryAttempt, m.retryMax = msg.Attempt, msg.MaxRetries
+		m.retryReason = msg.Reason
 		return m, m.readNextStreamEvent()
 
 	case StreamDoneMsg:
@@ -795,6 +808,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(blocks) > 0 {
 				m.history = append(m.history, provider.BuildAssistantMessage(blocks))
 			}
+		} else if !m.streamEmitted && len(m.pendingToolCalls) == 0 {
+			// Upstream model finished without text, reasoning, or tool calls.
+			// Provide an explicit non-fatal diagnostic so the UI does not silently go blank.
+			m.messages = append(m.messages, chatMessage{
+				role:    "assistant",
+				content: "*(model returned an empty response — please retry)*",
+				isError: true,
+			})
 		}
 
 		m.streaming = false
@@ -1318,12 +1339,14 @@ func (m *Model) stopModelStream() {
 	}
 	m.streamGeneration++
 	m.retryUntil = time.Time{}
+	m.retryReason = ""
 }
 
 // launchStream starts a new ConverseStream and reads the first event.
 func (m *Model) launchStream() tea.Cmd {
 	m.stopModelStream()
 	m.streaming = true
+	m.streamEmitted = false
 	m.streamBuf.Reset()
 	m.reasoningBuf.Reset()
 	m.reasoningSignature = ""
@@ -2219,7 +2242,11 @@ func (m *Model) renderInput() string {
 			content = ErrorStyle.Render("Press esc again to interrupt, or wait...")
 		} else if !m.retryUntil.IsZero() {
 			remaining := max(0, int(time.Until(m.retryUntil).Seconds())+1)
-			content = fmt.Sprintf("Rate limited (429): retry %d/%d in %ds — esc twice to cancel", m.retryAttempt, m.retryMax, remaining)
+			if m.retryReason != "" {
+				content = fmt.Sprintf("Upstream %s: retry %d/%d in %ds — esc twice to cancel", m.retryReason, m.retryAttempt, m.retryMax, remaining)
+			} else {
+				content = fmt.Sprintf("Rate limited (429): retry %d/%d in %ds — esc twice to cancel", m.retryAttempt, m.retryMax, remaining)
+			}
 		} else {
 			content = SpinnerStyle.Render(m.spinner.View()) + " thinking..."
 		}
