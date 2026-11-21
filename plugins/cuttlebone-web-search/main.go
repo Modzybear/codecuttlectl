@@ -1,13 +1,10 @@
-// cuttlebone-web-search is a Cuttlebone plugin that provides web search and
-// URL fetching capabilities. It uses Exa's free MCP endpoint for search and
-// direct HTTP fetching with HTML-to-text conversion for URL content retrieval.
-//
-// Two tools are exposed:
-//   - websearch: Search the web using Exa's MCP endpoint (no API key required)
-//   - webfetch: Fetch and convert a URL's content to readable text/markdown
+// cuttlebone-web-search provides the websearch tool using Exa's free MCP
+// endpoint by default, or an opt-in Parallel Search MCP backend.
+// URL retrieval is provided separately by cuttlebone-web-fetch.
 //
 // Environment variables:
 //   - EXA_API_KEY: Optional. Provides higher rate limits for Exa search.
+//   - CODECUTTLECTL_WEB_SEARCH_PROVIDER: exa (default) or parallel.
 package main
 
 import (
@@ -31,7 +28,9 @@ import (
 var skillFS embed.FS
 
 type webSearchPlugin struct {
-	httpClient *http.Client
+	httpClient        *http.Client
+	provider          string
+	parallelSessionID string
 }
 
 // --- Tool Input Structs ---
@@ -91,12 +90,21 @@ type mcpError struct {
 // --- Plugin Implementation ---
 
 func (p *webSearchPlugin) Describe(ctx context.Context) (*pb.DescribeResponse, error) {
+	if err := p.validateProvider(); err != nil {
+		return nil, err
+	}
+	inputSchema := schema.MustSchema(&searchInput{})
+	description := "Search the web and fetch URL content. Performs real-time web searches via Exa and retrieves/converts web page content to readable text. Use for accessing information beyond the knowledge cutoff, researching APIs, or reading documentation."
+	if p.provider == "parallel" {
+		inputSchema = schema.MustSchema(&parallelSearchInput{})
+		description = "Search the web via Parallel for current information, API references, and documentation. Returns source URLs and relevant excerpts."
+	}
 	return &pb.DescribeResponse{
 		Name:           "websearch",
-		Description:    "Search the web and fetch URL content. Performs real-time web searches via Exa and retrieves/converts web page content to readable text. Use for accessing information beyond the knowledge cutoff, researching APIs, or reading documentation.",
-		InputSchema:    schema.MustSchema(&searchInput{}),
+		Description:    description,
+		InputSchema:    inputSchema,
 		LlmContextHint: `Use websearch to find current information, documentation, API references, or anything beyond your training data. The current year is ` + fmt.Sprintf("%d", time.Now().Year()) + `. Always use the current year when searching for recent information.`,
-		Version:        "1.0.0",
+		Version:        "1.1.0",
 		Capabilities: &pb.ToolCapabilities{
 			SupportsCancellation: true,
 			MaxTimeoutSeconds:    30,
@@ -109,6 +117,9 @@ func (p *webSearchPlugin) Describe(ctx context.Context) (*pb.DescribeResponse, e
 }
 
 func (p *webSearchPlugin) Execute(ctx context.Context, req *pb.ExecuteRequest) (*pb.ExecuteResponse, error) {
+	if err := p.validateProvider(); err != nil {
+		return &pb.ExecuteResponse{IsError: true, ErrorMessage: err.Error()}, nil
+	}
 	var params searchInput
 	if err := json.Unmarshal([]byte(req.Input), &params); err != nil {
 		return &pb.ExecuteResponse{
@@ -122,6 +133,22 @@ func (p *webSearchPlugin) Execute(ctx context.Context, req *pb.ExecuteRequest) (
 			IsError:      true,
 			ErrorMessage: "query is required",
 		}, nil
+	}
+	if p.provider == "parallel" {
+		// Exa's per-call controls have no equivalent on the anonymous Parallel
+		// endpoint. Reject them rather than silently changing their meaning.
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal([]byte(req.Input), &fields)
+		for _, name := range []string{"type", "num_results"} {
+			if _, ok := fields[name]; ok {
+				return &pb.ExecuteResponse{IsError: true, ErrorMessage: name + " is only supported by the Exa backend"}, nil
+			}
+		}
+		result, err := p.parallelSearch(ctx, params.Query)
+		if err != nil {
+			return &pb.ExecuteResponse{IsError: true, ErrorMessage: fmt.Sprintf("search failed: %v", err)}, nil
+		}
+		return &pb.ExecuteResponse{Output: result, Metadata: map[string]string{"query": params.Query, "provider": "parallel"}}, nil
 	}
 
 	numResults := params.NumResults.Int()
@@ -279,10 +306,5 @@ func extractMCPContent(resp mcpResponse) (string, error) {
 }
 
 func main() {
-	plugin := &webSearchPlugin{
-		httpClient: &http.Client{
-			Timeout: 25 * time.Second,
-		},
-	}
-	pluginkit.Serve(plugin)
+	pluginkit.Serve(newWebSearchPlugin())
 }
