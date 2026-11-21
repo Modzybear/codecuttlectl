@@ -50,9 +50,10 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 	tools := make(map[int]*toolCall)
 	toolBytes := 0
 	var usage streamUsage
-	var finishReason string
+	var finishReason, nativeFinishReason string
 	finished, done := false, false
 	generated := false
+	emittedVisible := false
 
 	emit := func(event provider.StreamEvent) error {
 		return sendStreamEvent(ctx, events, event)
@@ -118,14 +119,25 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 					(choice.FinishReason != "" && choice.FinishReason != finishReason) {
 					return fmt.Errorf("openrouter: content or conflicting finish reason after completion")
 				}
+				if choice.NativeFinishReason != "" && nativeFinishReason != "" && !strings.EqualFold(choice.NativeFinishReason, nativeFinishReason) {
+					return fmt.Errorf("openrouter: conflicting native finish reason after completion")
+				}
+				if choice.NativeFinishReason != "" && nativeFinishReason == "" {
+					nativeFinishReason = choice.NativeFinishReason
+				}
 				continue
 			}
+			if choice.NativeFinishReason != "" {
+				nativeFinishReason = choice.NativeFinishReason
+			}
 			if delta.Reasoning != "" {
+				emittedVisible = true
 				if err := emit(provider.ReasoningDeltaEvent{Text: delta.Reasoning}); err != nil {
 					return err
 				}
 			}
 			if delta.Content != "" {
+				emittedVisible = true
 				if err := emit(provider.TextDeltaEvent{Text: delta.Content}); err != nil {
 					return err
 				}
@@ -209,6 +221,21 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 	}
 	if !finished {
 		return fmt.Errorf("openrouter: stream ended before finish reason: %w", io.ErrUnexpectedEOF)
+	}
+	if err, abnormal := classifyAbnormalFinish(finishReason, nativeFinishReason, emittedVisible); abnormal {
+		if usage.PromptTokens != nil || usage.CompletionTokens != nil {
+			event := provider.UsageEvent{
+				InputTokensUnknown: usage.PromptTokens == nil || *usage.PromptTokens == 0,
+			}
+			if usage.PromptTokens != nil {
+				event.InputTokens = *usage.PromptTokens
+			}
+			if usage.CompletionTokens != nil {
+				event.OutputTokens = *usage.CompletionTokens
+			}
+			_ = emit(event)
+		}
+		return err
 	}
 	if len(tools) > 0 && finishReason != "tool_calls" {
 		return fmt.Errorf("openrouter: tool calls interrupted by finish reason %q", finishReason)

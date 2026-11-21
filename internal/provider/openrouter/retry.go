@@ -7,11 +7,94 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const maxRateLimitRetries = 2
 const maxRateLimitWait = 2 * time.Minute
+const maxMalformedRetries = 3
+
+// malformedResponseError represents an upstream provider generation failure
+// (e.g. Gemini MALFORMED_RESPONSE / MALFORMED_FUNCTION_CALL) that OpenRouter
+// may normalize to finish_reason:"stop" or "error". Bounded retries are
+// adapter-owned so outer conversation loops do not multiply retries.
+type malformedResponseError struct {
+	finishReason string
+	nativeReason string
+	partial      bool
+	reason       string
+}
+
+func (e *malformedResponseError) Error() string {
+	target := e.nativeReason
+	var message string
+	if target != "" {
+		message = fmt.Sprintf("openrouter: upstream malformed response (%s)", target)
+	} else {
+		message = fmt.Sprintf("openrouter: upstream generation error (finish_reason=%s)", e.finishReason)
+	}
+	if e.partial {
+		return message + "; partial response received, automatic retry suppressed"
+	}
+	if e.reason != "" {
+		return message + "; " + e.reason
+	}
+	return message
+}
+
+func (*malformedResponseError) RetryHandled() bool { return true }
+
+// isMalformedNativeFinishReason checks for upstream generation failure reasons.
+func isMalformedNativeFinishReason(native string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(native))
+	switch upper {
+	case "MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL":
+		return true
+	default:
+		return false
+	}
+}
+
+// classifyAbnormalFinish inspects finish_reason and native_finish_reason.
+// Returns (err, true) when the stream/completion terminated abnormally.
+// Only explicit malformed native reasons (and bare finish_reason:"error" with
+// no native reason) are retryable via malformedResponseError; explicit
+// policy/safety or other non-malformed native reasons with finish_reason:"error"
+// surface immediately as non-retryable upstream errors without replaying.
+func classifyAbnormalFinish(finishReason, nativeFinishReason string, partial bool) (error, bool) {
+	native := strings.TrimSpace(nativeFinishReason)
+	if isMalformedNativeFinishReason(native) {
+		return &malformedResponseError{
+			finishReason: finishReason,
+			nativeReason: native,
+			partial:      partial,
+		}, true
+	}
+	if strings.EqualFold(finishReason, "error") {
+		if native == "" {
+			return &malformedResponseError{
+				finishReason: finishReason,
+				partial:      partial,
+			}, true
+		}
+		return fmt.Errorf("openrouter: upstream generation failed (%s)", native), true
+	}
+	return nil, false
+}
+
+func malformedRetryDelay(err error, retries int) (time.Duration, bool) {
+	var mErr *malformedResponseError
+	if !errors.As(err, &mErr) || mErr.partial {
+		return 0, false
+	}
+	if retries >= maxMalformedRetries {
+		mErr.reason = fmt.Sprintf("retry limit reached (%d attempts); try again", retries+1)
+		return 0, false
+	}
+	delay := time.Duration(1<<uint(retries)) * time.Second
+	return delay, true
+}
 
 // rateLimitError is handled by this adapter, not an outer conversation retry
 // loop. Retrying after any generated content requires explicit user action.

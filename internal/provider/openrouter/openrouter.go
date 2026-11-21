@@ -133,29 +133,45 @@ func fetchModels(ctx context.Context, httpClient *http.Client, baseURL string) (
 func (c *Client) Converse(ctx context.Context, req provider.Request) (*provider.Response, error) {
 	body := c.buildRequest(req, false)
 
-	var respBody io.ReadCloser
-	for retries := 0; ; retries++ {
-		var err error
-		respBody, err = c.doRequest(ctx, body)
+	for rateRetries, malformedRetries := 0, 0; ; {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		respBody, err := c.doRequest(ctx, body)
 		if err == nil {
-			break
+			var completion chatCompletion
+			err = json.NewDecoder(respBody).Decode(&completion)
+			respBody.Close()
+			if err != nil {
+				return nil, fmt.Errorf("openrouter: decoding response: %w", err)
+			}
+			if len(completion.Choices) > 0 {
+				choice := completion.Choices[0]
+				if abnormalErr, abnormal := classifyAbnormalFinish(choice.FinishReason, choice.NativeFinishReason, false); abnormal {
+					err = abnormalErr
+				}
+			}
+			if err == nil {
+				return completionToResponse(completion), nil
+			}
 		}
-		delay, retry := rateLimitDelay(err, retries)
-		if !retry {
-			return nil, err
-		}
-		if err := c.waitRetry(ctx, delay); err != nil {
-			return nil, err
-		}
-	}
-	defer respBody.Close()
 
-	var completion chatCompletion
-	if err := json.NewDecoder(respBody).Decode(&completion); err != nil {
-		return nil, fmt.Errorf("openrouter: decoding response: %w", err)
+		if delay, retry := rateLimitDelay(err, rateRetries); retry {
+			rateRetries++
+			if err := c.waitRetry(ctx, delay); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if delay, retry := malformedRetryDelay(err, malformedRetries); retry {
+			malformedRetries++
+			if err := c.waitRetry(ctx, delay); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		return nil, err
 	}
-
-	return completionToResponse(completion), nil
 }
 
 // ConverseStream sends messages and streams the response via channel.
@@ -167,7 +183,7 @@ func (c *Client) ConverseStream(ctx context.Context, req provider.Request) <-cha
 
 		body := c.buildRequest(req, true)
 
-		for retries := 0; ; retries++ {
+		for rateRetries, malformedRetries := 0, 0; ; {
 			if ctx.Err() != nil {
 				return
 			}
@@ -185,19 +201,37 @@ func (c *Client) ConverseStream(ctx context.Context, req provider.Request) <-cha
 			if err == nil {
 				return
 			}
-			delay, retry := rateLimitDelay(err, retries)
-			if !retry {
-				_ = sendStreamEvent(ctx, events, provider.StreamErrorEvent{Err: err})
-				return
+			if delay, retry := rateLimitDelay(err, rateRetries); retry {
+				rateRetries++
+				if sendStreamEvent(ctx, events, provider.RetryEvent{
+					Attempt: rateRetries, MaxRetries: maxRateLimitRetries, Delay: delay,
+				}) != nil {
+					return
+				}
+				if c.waitRetry(ctx, delay) != nil {
+					return
+				}
+				continue
 			}
-			if sendStreamEvent(ctx, events, provider.RetryEvent{
-				Attempt: retries + 1, MaxRetries: maxRateLimitRetries, Delay: delay,
-			}) != nil {
-				return
+			if delay, retry := malformedRetryDelay(err, malformedRetries); retry {
+				malformedRetries++
+				var mErr *malformedResponseError
+				reason := "malformed response"
+				if errors.As(err, &mErr) && mErr.nativeReason != "" {
+					reason = mErr.nativeReason
+				}
+				if sendStreamEvent(ctx, events, provider.RetryEvent{
+					Attempt: malformedRetries, MaxRetries: maxMalformedRetries, Delay: delay, Reason: reason,
+				}) != nil {
+					return
+				}
+				if c.waitRetry(ctx, delay) != nil {
+					return
+				}
+				continue
 			}
-			if c.waitRetry(ctx, delay) != nil {
-				return
-			}
+			_ = sendStreamEvent(ctx, events, provider.StreamErrorEvent{Err: err})
+			return
 		}
 	}()
 

@@ -76,9 +76,10 @@ type chatCompletion struct {
 
 // chatChoice represents a single completion choice.
 type chatChoice struct {
-	Index        int         `json:"index"`
-	Message      chatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"`
+	Index              int         `json:"index"`
+	Message            chatMessage `json:"message"`
+	FinishReason       string      `json:"finish_reason"`
+	NativeFinishReason string      `json:"native_finish_reason,omitempty"`
 }
 
 // chatUsage reports token consumption.
@@ -102,9 +103,10 @@ type chatCompletionChunk struct {
 
 // chunkChoice is a streaming choice delta.
 type chunkChoice struct {
-	Index        int        `json:"index"`
-	Delta        chunkDelta `json:"delta"`
-	FinishReason string     `json:"finish_reason,omitempty"`
+	Index              int        `json:"index"`
+	Delta              chunkDelta `json:"delta"`
+	FinishReason       string     `json:"finish_reason,omitempty"`
+	NativeFinishReason string     `json:"native_finish_reason,omitempty"`
 }
 
 // chunkDelta is the incremental content in a streaming chunk.
