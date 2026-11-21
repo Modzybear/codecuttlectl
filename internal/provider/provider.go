@@ -199,11 +199,12 @@ type UsageEvent struct {
 
 func (UsageEvent) streamEvent() {}
 
-// RetryEvent reports an adapter-owned rate-limit wait, not response content.
+// RetryEvent reports an adapter-owned retry wait, not response content.
 type RetryEvent struct {
 	Attempt    int
 	MaxRetries int
 	Delay      time.Duration
+	Reason     string // Optional reason (empty defaults to rate-limit 429 for backwards compat)
 }
 
 func (RetryEvent) streamEvent() {}
