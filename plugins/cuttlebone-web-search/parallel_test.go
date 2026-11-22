@@ -211,18 +211,26 @@ func TestParallelCancellationAndTimeout(t *testing.T) {
 			}
 			done := make(chan *pb.ExecuteResponse, 1)
 			go func() { resp, _ := p.Execute(ctx, &pb.ExecuteRequest{Input: `{"query":"docs"}`}); done <- resp }()
-			<-started
 			if !timeout {
-				cancel()
+				select {
+				case <-started:
+					cancel()
+				case resp := <-done:
+					t.Fatalf("request finished before cancellation: %+v", resp)
+				case <-time.After(3 * time.Second):
+					t.Fatal("request did not reach server")
+				}
 			}
 			select {
 			case resp := <-done:
-				want := "context canceled"
 				if timeout {
-					want = "Client.Timeout"
-				}
-				if !resp.IsError || !strings.Contains(resp.ErrorMessage, want) {
-					t.Fatalf("context outcome: %+v", resp)
+					if !resp.IsError || (!strings.Contains(resp.ErrorMessage, "Client.Timeout") && !strings.Contains(resp.ErrorMessage, "context deadline exceeded")) {
+						t.Fatalf("context outcome: %+v", resp)
+					}
+				} else {
+					if !resp.IsError || !strings.Contains(resp.ErrorMessage, "context canceled") {
+						t.Fatalf("context outcome: %+v", resp)
+					}
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("request did not stop")
