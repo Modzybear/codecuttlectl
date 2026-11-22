@@ -16,19 +16,26 @@ A typical coding session accumulates large tool results:
 
 After 10+ turns with file reads, 100-200k tokens of stale tool results sit in the context window. The model is paying (in latency and cost) to re-process content it looked at 15 minutes ago and doesn't need byte-for-byte.
 
-## Current Implementation: Heuristic Compaction
+## Current Implementation: Layer 1 — Heuristic Tool-Result Compaction
 
 ### When It Triggers
 
-Compaction runs **on every API call** for tool results older than the last 2 user turns. There is no minimum context usage threshold for basic compaction — if you read a file 3 turns ago, it gets summarized on the next call regardless of how full the context window is. This saves tokens from the start of the session.
+Compaction distinguishes between **large cloud/frontier models** (`DefaultConfig`) and **small/local models** (`SmallModelConfig`, gated by `needsGroundingAssist()` — Ollama models or providers explicitly reporting `<= 262k` context):
 
-When context usage exceeds **50%** of the window, compaction becomes more aggressive: `PreserveRecentTurns` drops from 2 to 1, meaning only the current turn's results are preserved in full.
+- **Preserve boundary**: Computes `max(turnBoundary, toolRoundBoundary)` so both multi-turn chats and long single-turn tool-call chains (100+ tool rounds) compact stale tool outputs while preserving the recent working window.
+- **Large models (prefix-cache friendly batching)**:
+  - Default window preserves the last **7 user turns** and **12 tool rounds** (`MinResultSize: 1000` chars).
+  - Mid-turn, `CompactProviderBatched` defers compaction until at least **`MinCompactBatch = 6`** newly compactable tool results have accumulated — invalidating prompt prefix caches in chunks rather than on every single tool round.
+  - Compaction is forced immediately at new user turn boundaries (`streamStep == 0`) or when context usage reaches **50%** (`ShouldCompact`), which also tightens preservation to **3 user turns** and **5 tool rounds**.
+- **Small / local models**:
+  - Preserves **2 user turns** and **4 tool rounds** (`MinResultSize: 500` chars, `SummaryMaxLines: 6`), compacting eagerly on every step.
 
 ### What It Does
 
-For tool results older than the last 2 user turns:
-- Results smaller than 1000 characters are left alone (not worth compacting)
-- Larger results are replaced with a head/tail summary:
+For tool results before the preserve boundary:
+- Already-compacted summaries (detected via omission markers) are skipped — preventing re-compaction loops.
+- Results smaller than `MinResultSize` are left alone.
+- Multi-line results exceeding `SummaryMaxLines` are replaced with a head/tail summary:
 
 ```
 line 1: package tui
@@ -44,32 +51,33 @@ line 1599:     for strings.Contains(cleaned, "\n\n\n") {
 line 1600:         cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
 ```
 
+- Huge single-line or few-line results (e.g., minified JSON where line count `<= SummaryMaxLines` but length `>= MinResultSize`) fall back to UTF-8-safe character head/tail truncation with `[... N chars omitted — use read_file with offset/limit to retrieve specific sections ...]`.
+
 The model sees: "I read this file, here's what the beginning and end look like, and I can re-read specific sections with offset/limit if needed."
 
 ### What It Preserves
 
-- **Last 2 user turns**: Everything from your most recent and previous messages stays intact
-- **Small results**: Anything under 1000 chars passes through unchanged
+- **Recent turns & tool rounds**: Last 7 user turns / 12 tool rounds on large models (tightened to 3 / 5 at ≥50% ctx); last 2 turns / 4 tool rounds on small models
+- **Small results**: Anything under `MinResultSize` (1000 chars default, 500 small models) passes through unchanged
 - **Inkwell**: Full content, always — governance and audit are never compromised
-- **Session file**: Full content persisted for resume — compaction is transient
 
 ### Cache Impact
 
-Compaction mutates the message history, which invalidates the Tier 3 (messages) cache on the next call. This is a one-time cost:
-- One cache write penalty (~$0.01-0.05 depending on history size)
-- All subsequent calls benefit from the reduced context (lower latency, lower cost)
+Compaction mutates the message history, which invalidates the Tier 3 (messages) prefix cache on the next call. By **batching** mid-turn compactions (`MinCompactBatch: 6`) and skipping already-compacted summaries, prefix caches remain warm across consecutive tool rounds instead of thrashing on every step:
+- One cache write penalty per batch of 6+ stale tool results (amortized across the next 6+ cached calls)
 - Tier 1 (tools) and Tier 2 (system prompt) caches are unaffected
-
-The math: if compaction frees 100k tokens, that saves ~$0.50/MTok × 100k = $0.05 per call in cache-read costs. After 1 call, the compaction has paid for itself.
 
 ## Configuration
 
 ```go
+compact.DefaultConfig() // Large / frontier models:
 compact.Config{
-    MaxContextPercent:   0.50,  // Trigger when > 50% of context window used
-    PreserveRecentTurns: 2,    // Never compact last 2 user turns
-    SummaryMaxLines:     8,    // Head + tail lines in summary
-    MinResultSize:       1000, // Don't compact results under 1000 chars
+    MaxContextPercent:        0.50, // Tighten & force when >= 50% of context window used
+    PreserveRecentTurns:      7,    // Preserve last 7 user turns (3 when >= 50%)
+    PreserveRecentToolRounds: 12,   // Preserve last 12 tool rounds (5 when >= 50%)
+    SummaryMaxLines:          8,    // Head + tail lines in summary
+    MinResultSize:            1000, // Don't compact results under 1000 chars
+    MinCompactBatch:          6,    // Batch mid-turn compactions to protect prefix cache
 }
 ```
 
@@ -101,7 +109,13 @@ These defaults are currently hardcoded. Future: expose via CLI flags or config f
 
 ## Future Enhancements
 
-### Phase 2: LLM-Generated Summaries
+### Layer 2: Epoch Rollover Compaction (Continuous Ultra-Long Sessions)
+
+Heuristic tool-result compaction shrinks stale tool outputs within an epoch, but cannot eliminate trajectory rot, dead-end debugging prose, or attention dilution past ~45–50% context fill. **Epoch Rollover Compaction** automates a structured `closeout → save_checkpoint → fresh-context bootstrap` cycle under a single persistent session ID, archiving closed epochs as immutable, fully timestamped JSON files (`epochs/{id}/epoch-NNN.json`) and seeding the new epoch with deterministic pinned state + agent-synthesized lessons, key files/directories, and resume instructions.
+
+**Full design**: [`docs/epoch-rollover-design.md`](epoch-rollover-design.md)
+
+### Phase 2: LLM-Generated Tool Summaries
 
 Replace the heuristic head/tail truncation with model-generated summaries. A Converse API call (same model, `max_tokens=200`) produces richer summaries:
 
@@ -176,6 +190,6 @@ This feeds back from Inkwell patterns: if the model re-reads a file within 3 tur
 
 1. **Never lose data** — Compaction is a context window optimization, not a deletion. Full content lives in Inkwell and session files forever.
 2. **Transparent to the model** — The omission marker tells the model exactly what was removed and how to get it back (`read_file with offset/limit`).
-3. **Conservative by default** — 50% threshold, preserve 2 recent turns, 1000-char minimum. Better to over-preserve than to lose something the model needs.
-4. **One cache miss is acceptable** — Compaction invalidates the message cache once, then all subsequent calls benefit from the smaller context.
+3. **Conservative by default** — 50% threshold, preserve 7 recent turns / 12 tool rounds, 1000-char minimum. Better to over-preserve than to lose something the model needs.
+4. **Cache-friendly batching** — Compaction batches mid-turn updates (`MinCompactBatch: 6`) so prefix caches stay warm across consecutive tool rounds instead of thrashing on every step.
 5. **Composable with future systems** — Summaries become metadata for vector retrieval. The architecture layers cleanly without rewrites.

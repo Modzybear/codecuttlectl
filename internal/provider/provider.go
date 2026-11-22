@@ -41,9 +41,18 @@ type InferenceConfig struct {
 }
 
 // Message is a provider-agnostic message.
+// Optional provenance metadata (ID, Epoch, Turn, Timestamp, NodeID, Model) is
+// persisted in session files and preserved across compaction and sanitization
+// without affecting wire payloads sent to LLM providers.
 type Message struct {
-	Role    Role
-	Content []ContentBlock
+	ID        string
+	Epoch     int
+	Turn      int
+	Timestamp time.Time
+	NodeID    string
+	Model     string
+	Role      Role
+	Content   []ContentBlock
 }
 
 // Role represents the message author role.
@@ -268,7 +277,8 @@ func EffectiveID(p Provider) string {
 // BuildUserTextMessage creates a new message with the given text for the user.
 func BuildUserTextMessage(text string) Message {
 	return Message{
-		Role: RoleUser,
+		Timestamp: time.Now().UTC(),
+		Role:      RoleUser,
 		Content: []ContentBlock{
 			TextBlock{Text: text},
 		},
@@ -278,8 +288,9 @@ func BuildUserTextMessage(text string) Message {
 // BuildAssistantMessage creates a new message for the assistant with the given blocks.
 func BuildAssistantMessage(blocks []ContentBlock) Message {
 	return Message{
-		Role:    RoleAssistant,
-		Content: blocks,
+		Timestamp: time.Now().UTC(),
+		Role:      RoleAssistant,
+		Content:   blocks,
 	}
 }
 
@@ -290,7 +301,8 @@ func BuildToolResultMessage(results []ToolResultBlock) Message {
 		blocks = append(blocks, r)
 	}
 	return Message{
-		Role:    RoleUser,
-		Content: blocks,
+		Timestamp: time.Now().UTC(),
+		Role:      RoleUser,
+		Content:   blocks,
 	}
 }

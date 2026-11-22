@@ -1436,3 +1436,314 @@ func TestUnmarshalProviderHistoryRemapsReasoningDetailIDsOnDuplicateToolUseID(t 
 		t.Errorf("input serialized slice was mutated: got ID %q, want 'call_1'", serialized[2].Blocks[0].ReasoningDetails[1].ID)
 	}
 }
+
+func TestMarshalUnmarshalProviderHistory_PreservesMessageProvenance(t *testing.T) {
+	ts := time.Date(2026, 4, 15, 14, 20, 30, 0, time.UTC)
+	msgs := []provider.Message{
+		{
+			ID:        "msg_0001",
+			Epoch:     2,
+			Turn:      3,
+			Timestamp: ts,
+			NodeID:    "orchestrator",
+			Model:     "openrouter:google/gemini-4-neon",
+			Role:      provider.RoleUser,
+			Content: []provider.ContentBlock{
+				provider.TextBlock{Text: "run audit"},
+			},
+		},
+		{
+			ID:        "msg_0002",
+			Epoch:     2,
+			Turn:      3,
+			Timestamp: ts.Add(time.Second),
+			NodeID:    "deep_coder",
+			Model:     "bedrock:us.anthropic.claude-opus-4-6-v1",
+			Role:      provider.RoleAssistant,
+			Content: []provider.ContentBlock{
+				provider.TextBlock{Text: "audit complete"},
+			},
+		},
+	}
+
+	serialized, err := MarshalProviderHistory(msgs)
+	if err != nil {
+		t.Fatalf("MarshalProviderHistory: %v", err)
+	}
+	if len(serialized) != 2 {
+		t.Fatalf("expected 2 serialized messages, got %d", len(serialized))
+	}
+	if serialized[0].ID != "msg_0001" || serialized[0].Epoch != 2 || serialized[0].Turn != 3 || !serialized[0].Timestamp.Equal(ts) || serialized[0].NodeID != "orchestrator" || serialized[0].Model != "openrouter:google/gemini-4-neon" {
+		t.Fatalf("unexpected serialized msg[0]: %+v", serialized[0])
+	}
+
+	data, err := json.Marshal(serialized)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var unmarshaled []Message
+	if err := json.Unmarshal(data, &unmarshaled); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	restored := UnmarshalProviderHistory(unmarshaled)
+	if len(restored) != 2 {
+		t.Fatalf("expected 2 restored messages, got %d", len(restored))
+	}
+	if restored[1].ID != "msg_0002" || restored[1].Epoch != 2 || restored[1].Turn != 3 || !restored[1].Timestamp.Equal(ts.Add(time.Second)) || restored[1].NodeID != "deep_coder" || restored[1].Model != "bedrock:us.anthropic.claude-opus-4-6-v1" {
+		t.Fatalf("unexpected restored msg[1]: %+v", restored[1])
+	}
+}
+
+func TestLegacySessionJSONCompatibility(t *testing.T) {
+	legacyJSON := `{
+		"meta": {
+			"id": "ses_legacy01",
+			"created_at": "2026-03-01T10:00:00Z",
+			"updated_at": "2026-03-01T10:05:00Z",
+			"title": "Legacy session",
+			"model": "us.anthropic.claude-opus-4-6-v1",
+			"region": "us-west-2",
+			"work_dir": "/tmp",
+			"stats": {"input_tokens": 100, "output_tokens": 50, "tool_calls": 1, "turns": 1}
+		},
+		"messages": [
+			{
+				"role": "user",
+				"blocks": [{"type": "text", "text": "inspect legacy"}]
+			},
+			{
+				"role": "assistant",
+				"blocks": [{"type": "text", "text": "legacy response"}]
+			}
+		],
+		"todos": [],
+		"inkwell": [],
+		"audit": {"events": []}
+	}`
+
+	var state SessionState
+	if err := json.Unmarshal([]byte(legacyJSON), &state); err != nil {
+		t.Fatalf("unmarshal legacy session JSON: %v", err)
+	}
+
+	if state.Meta.EffectiveEpoch() != 1 {
+		t.Errorf("EffectiveEpoch() = %d, want 1 for legacy session", state.Meta.EffectiveEpoch())
+	}
+	if state.Meta.CurrentEpoch != 0 {
+		t.Errorf("CurrentEpoch = %d, want 0 raw", state.Meta.CurrentEpoch)
+	}
+	if state.OriginalObjective != "" {
+		t.Errorf("OriginalObjective = %q, want empty", state.OriginalObjective)
+	}
+	if len(state.Epochs) != 0 {
+		t.Errorf("len(Epochs) = %d, want 0", len(state.Epochs))
+	}
+
+	restored := UnmarshalProviderHistory(state.Messages)
+	if len(restored) != 2 {
+		t.Fatalf("expected 2 restored provider messages, got %d", len(restored))
+	}
+	if !restored[0].Timestamp.IsZero() {
+		t.Errorf("expected legacy message timestamp to be zero, got %v", restored[0].Timestamp)
+	}
+}
+
+func TestFileStoreEpochArchivesAtomicSaveLoadListAndCascade(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	id, err := fs.Create(SessionMeta{Model: "openrouter:google/gemini-4-neon", WorkDir: "/workspace"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// List initially has 0 epoch archives
+	epochs, err := fs.ListEpochArchives(id)
+	if err != nil {
+		t.Fatalf("ListEpochArchives: %v", err)
+	}
+	if len(epochs) != 0 {
+		t.Fatalf("expected 0 epoch archives initially, got %v", epochs)
+	}
+
+	// Save Epoch 1 archive
+	arch1 := &EpochArchive{
+		SessionID: id,
+		Epoch:     1,
+		ClosedAt:  time.Now().UTC(),
+		Checkpoint: EpochCheckpoint{
+			Epoch:            1,
+			Trigger:          RolloverTriggerSoftThreshold,
+			TokensAtRollover: 45000,
+			ContextWindow:    100000,
+			Pinned: PinnedState{
+				OriginalObjective: "Build compiler",
+				WorkDir:           "/workspace",
+				GitBranch:         "main",
+			},
+			Payload: CheckpointPayload{
+				Summary:            "Completed AST parser",
+				LessonsLearned:     []string{"Use table-driven tests"},
+				KeyFiles:           []FileContextNote{{Path: "parser.go", Purpose: "Core AST logic"}},
+				ResumeInstructions: "Implement type checker",
+			},
+		},
+		Messages: []Message{
+			{Role: "user", Blocks: []ContentItem{{Type: "text", Text: "Build compiler"}}},
+			{Role: "assistant", Blocks: []ContentItem{{Type: "text", Text: "AST parser done"}}},
+		},
+		Inkwell: []InkEntry{
+			{ToolName: "read_file", Output: "package main"},
+		},
+	}
+
+	relPath1, err := fs.SaveEpochArchive(id, arch1)
+	if err != nil {
+		t.Fatalf("SaveEpochArchive(1): %v", err)
+	}
+	wantRel1 := filepath.ToSlash(filepath.Join("epochs", id, "epoch-001.json"))
+	if relPath1 != wantRel1 {
+		t.Errorf("SaveEpochArchive relPath = %q, want %q", relPath1, wantRel1)
+	}
+
+	// Save Epoch 2 archive
+	arch2 := &EpochArchive{
+		SessionID: id,
+		Epoch:     2,
+		ClosedAt:  time.Now().UTC(),
+		Checkpoint: EpochCheckpoint{
+			Epoch:            2,
+			Trigger:          RolloverTriggerManual,
+			TokensAtRollover: 52000,
+			ContextWindow:    100000,
+			Pinned: PinnedState{
+				OriginalObjective: "Build compiler",
+				WorkDir:           "/workspace",
+			},
+			Payload: CheckpointPayload{
+				Summary:            "Completed type checker",
+				KeyFiles:           []FileContextNote{{Path: "checker.go", Purpose: "Type checker"}},
+				ResumeInstructions: "Implement codegen",
+			},
+		},
+		Messages: []Message{
+			{Role: "user", Blocks: []ContentItem{{Type: "text", Text: "Continue type checker"}}},
+		},
+	}
+	if _, err := fs.SaveEpochArchive(id, arch2); err != nil {
+		t.Fatalf("SaveEpochArchive(2): %v", err)
+	}
+
+	// Verify ListEpochArchives returns [1, 2] sorted
+	epochs, err = fs.ListEpochArchives(id)
+	if err != nil {
+		t.Fatalf("ListEpochArchives: %v", err)
+	}
+	if !reflect.DeepEqual(epochs, []int{1, 2}) {
+		t.Fatalf("ListEpochArchives = %v, want [1, 2]", epochs)
+	}
+
+	// Verify LoadEpochArchive retrieves exact data
+	loaded1, err := fs.LoadEpochArchive(id, 1)
+	if err != nil {
+		t.Fatalf("LoadEpochArchive(1): %v", err)
+	}
+	if loaded1.Epoch != 1 || loaded1.SessionID != id || loaded1.Checkpoint.Payload.Summary != "Completed AST parser" {
+		t.Fatalf("unexpected loaded archive 1: %+v", loaded1)
+	}
+	if len(loaded1.Messages) != 2 || len(loaded1.Inkwell) != 1 {
+		t.Fatalf("unexpected messages/inkwell count in loaded archive 1: msgs=%d ink=%d", len(loaded1.Messages), len(loaded1.Inkwell))
+	}
+
+	// Verify FileStore.List() does NOT list archive files as top-level sessions
+	sessions, err := fs.List(10)
+	if err != nil {
+		t.Fatalf("fs.List: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != id {
+		t.Fatalf("fs.List returned %d sessions (%+v), want exactly 1 session %s", len(sessions), sessions, id)
+	}
+
+	// Verify Delete cascades to epoch directory
+	if err := fs.Delete(id); err != nil {
+		t.Fatalf("fs.Delete: %v", err)
+	}
+	if _, err := fs.Load(id); err == nil {
+		t.Fatal("expected Load to fail after Delete")
+	}
+	if _, err := fs.LoadEpochArchive(id, 1); err == nil {
+		t.Fatal("expected LoadEpochArchive to fail after cascade Delete")
+	}
+	epochsAfterDelete, err := fs.ListEpochArchives(id)
+	if err != nil {
+		t.Fatalf("ListEpochArchives after delete: %v", err)
+	}
+	if len(epochsAfterDelete) != 0 {
+		t.Fatalf("expected 0 epoch archives after delete, got %v", epochsAfterDelete)
+	}
+}
+
+func TestFileStorePruneCascadesEpochArchives(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	id, err := fs.Create(SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	arch := &EpochArchive{
+		SessionID: id,
+		Epoch:     1,
+		Checkpoint: EpochCheckpoint{
+			Epoch: 1,
+			Payload: CheckpointPayload{
+				Summary:            "Old epoch",
+				KeyFiles:           []FileContextNote{{Path: "a.go", Purpose: "a"}},
+				ResumeInstructions: "resume",
+			},
+		},
+	}
+	if _, err := fs.SaveEpochArchive(id, arch); err != nil {
+		t.Fatalf("SaveEpochArchive: %v", err)
+	}
+
+	// Backdate the session file to 10 days ago
+	oldTime := time.Now().UTC().Add(-10 * 24 * time.Hour)
+	state, err := fs.Load(id)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	state.Meta.UpdatedAt = oldTime
+	data, _ := json.MarshalIndent(state, "", "  ")
+	_ = os.WriteFile(fs.filePath(id), data, 0600)
+
+	// Prune older than 5 days
+	pruned, err := fs.Prune(5 * 24 * time.Hour)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned %d sessions, want 1", pruned)
+	}
+
+	// Verify both session file and epoch archive directory are gone
+	if _, err := fs.Load(id); err == nil {
+		t.Fatal("expected session file to be pruned")
+	}
+	epochs, err := fs.ListEpochArchives(id)
+	if err != nil {
+		t.Fatalf("ListEpochArchives: %v", err)
+	}
+	if len(epochs) != 0 {
+		t.Fatalf("expected 0 archives after prune, got %v", epochs)
+	}
+}

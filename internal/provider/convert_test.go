@@ -2,6 +2,7 @@ package provider
 
 import (
 	"testing"
+	"time"
 )
 
 func TestSanitizeHistoryForProvider(t *testing.T) {
@@ -174,5 +175,28 @@ func TestEffectiveID(t *testing.T) {
 	fp.markCooldown(p2.ID(), nowFunc())
 	if got := EffectiveID(fp); got != "orchestrator" {
 		t.Fatalf("EffectiveID(all cooling) = %q, want logical ID", got)
+	}
+}
+
+func TestSanitizeHistoryForProvider_PreservesProvenanceMetadata(t *testing.T) {
+	ts := time.Date(2026, 4, 15, 12, 34, 56, 0, time.UTC)
+	msgs := []Message{
+		{
+			ID:        "msg_0001",
+			Epoch:     2,
+			Turn:      7,
+			Timestamp: ts,
+			NodeID:    "orchestrator",
+			Model:     "openrouter:google/gemini-4-neon",
+			Role:      RoleUser,
+			Content:   []ContentBlock{TextBlock{Text: "hello"}},
+		},
+	}
+	got := SanitizeHistoryForProvider(msgs, "bedrock:us.anthropic.claude-opus-4-6-v1")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(got))
+	}
+	if got[0].ID != "msg_0001" || got[0].Epoch != 2 || got[0].Turn != 7 || !got[0].Timestamp.Equal(ts) || got[0].NodeID != "orchestrator" || got[0].Model != "openrouter:google/gemini-4-neon" {
+		t.Fatalf("provenance metadata lost across SanitizeHistoryForProvider: %+v", got[0])
 	}
 }

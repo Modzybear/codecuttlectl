@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
@@ -11,10 +12,17 @@ import (
 )
 
 // Message is the JSON-serializable representation of a conversation message.
-// It provides a clean round-trip between Bedrock SDK types and persistent storage.
+// It provides a clean round-trip between Bedrock SDK types and persistent storage,
+// retaining full provenance (ID, Epoch, Turn, Timestamp, NodeID, Model) across epochs.
 type Message struct {
-	Role   string        `json:"role"` // "user", "assistant"
-	Blocks []ContentItem `json:"blocks"`
+	ID        string        `json:"id,omitempty"`        // Monotonic or UUID per message ("msg_0001")
+	Epoch     int           `json:"epoch,omitempty"`     // 1-indexed epoch number (0 for legacy sessions)
+	Turn      int           `json:"turn,omitempty"`      // Session-global turn number
+	Timestamp time.Time     `json:"timestamp,omitempty"` // UTC creation timestamp
+	NodeID    string        `json:"node_id,omitempty"`   // Swarm node ID (e.g. "orchestrator", "deep_coder")
+	Model     string        `json:"model,omitempty"`     // Effective provider/model ID
+	Role      string        `json:"role"`                // "user", "assistant"
+	Blocks    []ContentItem `json:"blocks"`
 }
 
 // ContentItem is a tagged union for serialized content blocks.
@@ -22,6 +30,9 @@ type Message struct {
 type ContentItem struct {
 	// Type discriminator: "text", "tool_use", "tool_result", "reasoning"
 	Type string `json:"type"`
+
+	// Timestamp when this block was recorded (optional)
+	Timestamp time.Time `json:"timestamp,omitempty"`
 
 	// For Type=="text": the text content
 	Text string `json:"text,omitempty"`
@@ -52,7 +63,13 @@ func MarshalProviderHistory(messages []providerPkg.Message) ([]Message, error) {
 
 	for _, msg := range messages {
 		serialized := Message{
-			Role: string(msg.Role),
+			ID:        msg.ID,
+			Epoch:     msg.Epoch,
+			Turn:      msg.Turn,
+			Timestamp: msg.Timestamp,
+			NodeID:    msg.NodeID,
+			Model:     msg.Model,
+			Role:      string(msg.Role),
 		}
 
 		for _, block := range msg.Content {
@@ -170,7 +187,16 @@ func UnmarshalProviderHistory(messages []Message) []providerPkg.Message {
 			}
 		}
 
-		result = append(result, providerPkg.Message{Role: role, Content: blocks})
+		result = append(result, providerPkg.Message{
+			ID:        msg.ID,
+			Epoch:     msg.Epoch,
+			Turn:      msg.Turn,
+			Timestamp: msg.Timestamp,
+			NodeID:    msg.NodeID,
+			Model:     msg.Model,
+			Role:      role,
+			Content:   blocks,
+		})
 	}
 
 	return result

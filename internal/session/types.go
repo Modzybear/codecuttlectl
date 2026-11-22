@@ -13,14 +13,23 @@ import (
 // SessionMeta is the lightweight metadata shown in session listings.
 // It is also the header of a full SessionState file.
 type SessionMeta struct {
-	ID        string    `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Title     string    `json:"title"`    // Agent-generated after first turn
-	Model     string    `json:"model"`    // Bedrock model ID used
-	Region    string    `json:"region"`   // AWS region
-	WorkDir   string    `json:"work_dir"` // Working directory at session start
-	Stats     Stats     `json:"stats"`
+	ID           string    `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Title        string    `json:"title"`                  // Agent-generated after first turn
+	Model        string    `json:"model"`                  // Bedrock model ID used
+	Region       string    `json:"region"`                 // AWS region
+	WorkDir      string    `json:"work_dir"`               // Working directory at session start
+	CurrentEpoch int       `json:"current_epoch,omitempty"` // 1-indexed active epoch (0 treated as 1 for legacy sessions)
+	Stats        Stats     `json:"stats"`
+}
+
+// EffectiveEpoch returns the 1-indexed epoch number, defaulting to 1 for legacy sessions.
+func (m SessionMeta) EffectiveEpoch() int {
+	if m.CurrentEpoch <= 0 {
+		return 1
+	}
+	return m.CurrentEpoch
 }
 
 // Stats tracks aggregate metrics for a session.
@@ -37,12 +46,88 @@ type Stats struct {
 // SessionState is the full persisted state of a session.
 // This is what gets serialized to disk and loaded on resume.
 type SessionState struct {
-	Meta         SessionMeta `json:"meta"`
-	Messages     []Message   `json:"messages"`                // Serializable conversation history
-	Todos        []todo.Item `json:"todos"`                   // Current task state
-	Inkwell      []InkEntry  `json:"inkwell"`                 // Tool execution diagnostics
-	Audit        AuditTrail  `json:"audit"`                   // Session-level governance/audit info
-	DraftMessage string      `json:"draft_message,omitempty"` // Content being actively typed
+	Meta              SessionMeta       `json:"meta"`
+	OriginalObjective string            `json:"original_objective,omitempty"` // Captured on Turn 1; anchored across all epochs
+	Messages          []Message         `json:"messages"`                     // Active epoch conversation history
+	Epochs            []EpochCheckpoint `json:"epochs,omitempty"`             // Completed epoch summaries & archive pointers
+	Todos             []todo.Item       `json:"todos"`                        // Current task state
+	Inkwell           []InkEntry        `json:"inkwell"`                      // Tool execution diagnostics
+	Audit             AuditTrail        `json:"audit"`                        // Session-level governance/audit info
+	DraftMessage      string            `json:"draft_message,omitempty"`      // Content being actively typed
+}
+
+// RolloverTrigger classifies what caused an epoch to roll over.
+type RolloverTrigger string
+
+const (
+	RolloverTriggerManual        RolloverTrigger = "manual"
+	RolloverTriggerSoftThreshold RolloverTrigger = "soft_threshold"
+	RolloverTriggerHardThreshold RolloverTrigger = "hard_threshold"
+)
+
+// EpochCheckpoint records the structured handoff and deterministic ground-truth
+// snapshot captured at the close of an epoch.
+type EpochCheckpoint struct {
+	Epoch             int               `json:"epoch"`                          // Completed epoch number (1, 2, ...)
+	CreatedAt         time.Time         `json:"created_at"`                     // UTC timestamp of rollover commit
+	Trigger           RolloverTrigger   `json:"trigger"`                        // "manual", "soft_threshold", "hard_threshold"
+	ArchiveFile       string            `json:"archive_file,omitempty"`         // Relative path e.g. "epochs/ses_abc12345/epoch-001.json"
+	MessageCount      int               `json:"message_count"`                  // Number of messages archived in this epoch
+	TurnRange         [2]int            `json:"turn_range"`                     // [firstTurn, lastTurn] inclusive
+	TokensAtRollover  int32             `json:"tokens_at_rollover"`             // Last API call total tokens before closeout
+	ContextWindow     int32             `json:"context_window"`                 // Effective context window at rollover
+	EstimatedCostUSD  float64           `json:"estimated_cost_usd"`             // Cumulative session cost at rollover
+	DocsPolicyApplied string            `json:"docs_policy_applied,omitempty"`  // "none", "milestone", "always"
+	Pinned            PinnedState       `json:"pinned"`                         // Harness-collected deterministic ground truth
+	Payload           CheckpointPayload `json:"payload"`                        // Agent-synthesized handoff from save_checkpoint
+}
+
+// PinnedState captures deterministic ground-truth gathered directly by the harness
+// (never rewritten by the LLM) to prevent requirement drift across epochs.
+type PinnedState struct {
+	OriginalObjective string      `json:"original_objective"`            // Anchored from Turn 1 (or user-updated goal)
+	Todos             []todo.Item `json:"todos,omitempty"`               // Authoritative task list snapshot
+	WorkDir           string      `json:"work_dir"`                      // Active working directory
+	GitBranch         string      `json:"git_branch,omitempty"`          // Current git branch
+	GitHeadCommit     string      `json:"git_head_commit,omitempty"`     // Short SHA + subject of HEAD
+	GitStatusShort    string      `json:"git_status_short,omitempty"`    // Output of `git status --short`
+	GitDiffStat       string      `json:"git_diff_stat,omitempty"`       // Output of `git diff --stat`
+	RecentCommits     []string    `json:"recent_commits,omitempty"`      // Up to 10 recent commits on branch
+	PendingAsyncTasks []string    `json:"pending_async_tasks,omitempty"` // In-flight swarm tasks at rollover
+}
+
+// CheckpointPayload is synthesized by the agent via the internal save_checkpoint tool.
+type CheckpointPayload struct {
+	Summary              string            `json:"summary"`
+	LessonsLearned       []string          `json:"lessons_learned"`
+	RecentlyChangedFiles []FileContextNote `json:"recently_changed_files,omitempty"`
+	KeyFiles             []FileContextNote `json:"key_files"`
+	KeyDirs              []DirContextNote  `json:"key_dirs,omitempty"`
+	OpenQuestions        []string          `json:"open_questions,omitempty"`
+	ResumeInstructions   string            `json:"resume_instructions"`
+	DocsUpdated          []string          `json:"docs_updated,omitempty"`
+}
+
+// FileContextNote annotates a priority file with its purpose for the next epoch.
+type FileContextNote struct {
+	Path    string `json:"path"`
+	Purpose string `json:"purpose"`
+}
+
+// DirContextNote annotates an important directory with its purpose and architectural role.
+type DirContextNote struct {
+	Path    string `json:"path"`
+	Purpose string `json:"purpose"`
+}
+
+// EpochArchive is the immutable, self-contained JSON document persisted when an epoch closes.
+type EpochArchive struct {
+	SessionID  string          `json:"session_id"`
+	Epoch      int             `json:"epoch"`
+	ClosedAt   time.Time       `json:"closed_at"`
+	Checkpoint EpochCheckpoint `json:"checkpoint"`
+	Messages   []Message       `json:"messages"`
+	Inkwell    []InkEntry      `json:"inkwell"`
 }
 
 // AuditTrail captures session-level governance and accounting metadata.

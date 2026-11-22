@@ -52,10 +52,9 @@ func CompactProvider(messages []provider.Message, currentTurn int, cfg Config) P
 		// Compact tool results in this message
 		newContent, freed, count := compactProviderToolResults(msg.Content, cfg)
 		if count > 0 {
-			result[i] = provider.Message{
-				Role:    msg.Role,
-				Content: newContent,
-			}
+			compactedMsg := msg
+			compactedMsg.Content = newContent
+			result[i] = compactedMsg
 			totalFreed += freed
 			compacted += count
 		} else {

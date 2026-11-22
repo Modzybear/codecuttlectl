@@ -54,11 +54,17 @@ type Agent struct {
 	reconciler *inkwell.Reconciler
 
 	// Session persistence
-	store     session.Store
-	sessionID string
-	inkwell   []session.InkEntry
-	turn      int
-	dirty     bool // true when state needs flushing to disk
+	store             session.Store
+	sessionID         string
+	inkwell           []session.InkEntry
+	archivedToolCalls int
+	turn              int
+	dirty             bool // true when state needs flushing to disk
+	currentEpoch      int
+	originalObjective string
+	epochs            []session.EpochCheckpoint
+	msgSeq            int
+	lastCallTokens    int32
 
 	// Sandbox
 	workbench  []string
@@ -1304,8 +1310,17 @@ func (a *Agent) loadSession() error {
 		}
 	}
 
-	// Restore turn counter from stats
+	// Restore turn counter & epoch metadata from session state
 	a.turn = state.Meta.Stats.Turns
+	a.currentEpoch = state.Meta.EffectiveEpoch()
+	a.originalObjective = state.OriginalObjective
+	if len(state.Epochs) > 0 {
+		a.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
+	}
+	if state.Meta.Stats.ToolCalls > len(a.inkwell) {
+		a.archivedToolCalls = state.Meta.Stats.ToolCalls - len(a.inkwell)
+	}
+	a.msgSeq = len(a.provHistory)
 
 	return nil
 }
@@ -1334,16 +1349,30 @@ func (a *Agent) flushSession() {
 		meta.ID = a.sessionID
 	}
 
-	// Update stats
+	// Update stats & epoch metadata
+	meta.CurrentEpoch = a.CurrentEpoch()
 	meta.Stats.Turns = a.turn
-	meta.Stats.ToolCalls = len(a.inkwell)
+	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
+
+	origObj := a.originalObjective
+	epochs := a.epochs
+	if loadErr == nil && existing != nil {
+		if origObj == "" {
+			origObj = existing.OriginalObjective
+		}
+		if len(epochs) == 0 && len(existing.Epochs) > 0 {
+			epochs = existing.Epochs
+		}
+	}
 
 	state := &session.SessionState{
-		Meta:     meta,
-		Messages: messages,
-		Todos:    a.todos.Items(),
-		Inkwell:  a.inkwell,
-		Audit:    a.AuditTrail(),
+		Meta:              meta,
+		OriginalObjective: origObj,
+		Messages:          messages,
+		Epochs:            epochs,
+		Todos:             a.todos.Items(),
+		Inkwell:           a.inkwell,
+		Audit:             a.AuditTrail(),
 	}
 
 	if err := a.store.Save(a.sessionID, state); err != nil {

@@ -238,10 +238,9 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 		}
 
 		if len(cleanBlocks) > 0 {
-			sanitized = append(sanitized, Message{
-				Role:    msg.Role,
-				Content: cleanBlocks,
-			})
+			outMsg := msg
+			outMsg.Content = cleanBlocks
+			sanitized = append(sanitized, outMsg)
 		}
 	}
 
