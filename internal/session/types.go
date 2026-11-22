@@ -14,14 +14,25 @@ import (
 // It is also the header of a full SessionState file.
 type SessionMeta struct {
 	ID           string    `json:"id"`
+	Alias        string    `json:"alias,omitempty"`
+	Pinned       bool      `json:"pinned,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Title        string    `json:"title"`                  // Agent-generated after first turn
 	Model        string    `json:"model"`                  // Bedrock model ID used
+	Morph        string    `json:"morph,omitempty"`
+	Tags         []string  `json:"tags,omitempty"`
 	Region       string    `json:"region"`                 // AWS region
 	WorkDir      string    `json:"work_dir"`               // Working directory at session start
 	CurrentEpoch int       `json:"current_epoch,omitempty"` // 1-indexed active epoch (0 treated as 1 for legacy sessions)
 	Stats        Stats     `json:"stats"`
+}
+
+// ListFilter specifies filtering criteria for session listings and searches.
+type ListFilter struct {
+	PinnedOnly bool
+	WorkDir    string
+	Query      string
 }
 
 // EffectiveEpoch returns the 1-indexed epoch number, defaulting to 1 for legacy sessions.

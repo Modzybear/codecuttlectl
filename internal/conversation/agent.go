@@ -75,6 +75,7 @@ type Agent struct {
 	// Sandbox
 	workbench  []string
 	morph      *swarm.Morphology
+	morphName  string
 	activeNode string
 	dispatcher swarm.EventDispatcher
 }
@@ -85,6 +86,7 @@ type Config struct {
 	Pool      provider.Pool     // Multi-model pool (if set, Client is ignored)
 	Provider  provider.Provider // Provider interface (takes precedence over Client when non-nil)
 	Morph     *swarm.Morphology // Swarm configuration (enables handoff tool)
+	MorphName string            // Canonical morphology name or path
 	PromptMgr *prompt.Manager
 	PluginMgr *pluginhost.Manager
 	WorkDir   string
@@ -209,6 +211,11 @@ func NewAgent(cfg Config) (*Agent, error) {
 		rcfg = *cfg.RolloverConfig
 	}
 
+	morphName := cfg.MorphName
+	if morphName == "" && cfg.Morph != nil {
+		morphName = cfg.Morph.Name
+	}
+
 	agent := &Agent{
 		client:       cfg.Client,
 		pool:         cfg.Pool,
@@ -230,6 +237,7 @@ func NewAgent(cfg Config) (*Agent, error) {
 		sessionID:    cfg.SessionID,
 		workbench:    cfg.Workbench,
 		morph:        cfg.Morph,
+		morphName:    morphName,
 		activeNode:   primaryID,
 		dispatcher:   cfg.EventDispatcher,
 	}
@@ -295,6 +303,7 @@ func (a *Agent) InitSession(model, region, workDir string) (string, error) {
 		Model:   model,
 		Region:  region,
 		WorkDir: workDir,
+		Morph:   a.morphName,
 	}
 
 	id, err := a.store.Create(meta)
@@ -1443,6 +1452,9 @@ func (a *Agent) flushSession() {
 	meta.CurrentEpoch = a.CurrentEpoch()
 	meta.Stats.Turns = a.turn
 	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
+	if meta.Morph == "" && a.morphName != "" {
+		meta.Morph = a.morphName
+	}
 
 	origObj := a.originalObjective
 	epochs := a.epochs

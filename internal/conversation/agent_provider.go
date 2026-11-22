@@ -668,6 +668,9 @@ func (a *Agent) flushSessionProvider() {
 	if a.cumulativeCostUSD > meta.Stats.EstimatedCostUSD {
 		meta.Stats.EstimatedCostUSD = a.cumulativeCostUSD
 	}
+	if meta.Morph == "" && a.morphName != "" {
+		meta.Morph = a.morphName
+	}
 
 	origObj := a.originalObjective
 	epochs := a.epochs

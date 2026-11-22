@@ -17,48 +17,78 @@
 ## Installation
 
 ```bash
-# Clone and build the CLI and bundled plugins
+# Clone the repository
 git clone https://github.com/Modzybear/codecuttlectl.git
 cd codecuttlectl
-make all
 
-# Run directly from the checkout
-./bin/codecuttlectl -plugin-dir ./bin/plugins
-
-# Optional: install system-wide
-sudo cp bin/codecuttlectl /usr/local/bin/codecuttlectl
-sudo mkdir -p /usr/local/lib/codecuttlectl/plugins
-sudo cp bin/plugins/* /usr/local/lib/codecuttlectl/plugins/
-
-echo 'alias c3="codecuttlectl -plugin-dir /usr/local/lib/codecuttlectl/plugins"' >> ~/.bashrc
-source ~/.bashrc
+# Freshly build and atomically install codecuttlectl, plugins, and starter morphs
+sudo make install
 ```
+
+`make install` automatically:
+1. Builds the `codecuttlectl` binary and installs it to `/usr/local/bin/codecuttlectl`.
+2. Builds all Cuttlebone plugins and installs them to `/usr/local/lib/codecuttlectl/plugins/`.
+3. Installs starter swarm morphologies into `/usr/local/share/codecuttlectl/morphs/`.
+
+### Zero-Alias & Automatic Discovery
+
+No shell wrapper or alias is required. When invoked as `codecuttlectl`, the CLI automatically discovers installed plugins and configuration across standard XDG / system locations:
+
+- **Plugin Auto-Discovery**: Automatically searches `~/.local/share/codecuttlectl/plugins`, `~/.local/lib/codecuttlectl/plugins`, and `/usr/local/lib/codecuttlectl/plugins`.
+- **Environment Variables**:
+  - `CODECUTTLE_PLUGIN_DIR`: Explicit plugin directory (or `none` to disable).
+  - `CODECUTTLE_MORPH`: Default morphology path or name.
+  - `CODECUTTLE_CONFIG`: Path to custom configuration file.
+- **User Configuration File** (`~/.config/codecuttlectl/config.yaml`):
+  ```yaml
+  plugin_dir: /usr/local/lib/codecuttlectl/plugins
+  default_morph: openrouter-expert-swarm
+  morphs_dir: ~/.config/codecuttlectl/morphs
+  ```
 
 ---
 
 ## Quickstart
 
 ```bash
-# Interactive TUI
-c3
+# Launch interactive TUI (auto-detects plugins and default morph)
+codecuttlectl
 
-# Run the example multi-agent morphology
-c3 --morph testdata/openrouter-astra-swarm.yaml
+# Interactive session picker (select, resume, pin, rename, or delete sessions)
+codecuttlectl -s
 
-# Local models via Ollama
-c3 --model ollama:qwen3:32b
-c3 --provider ollama --model gemma4:31b
+# Resume an existing session by ID or friendly alias (auto-restores workdir and morph)
+codecuttlectl -r my-feature
+codecuttlectl --session ses_abc123
 
-# OpenRouter / Google Gemini
-c3 --provider openrouter --model anthropic/claude-3.7-sonnet
-c3 --provider google --model gemini-2.5-pro
+# List, filter, and search sessions
+codecuttlectl --list-sessions
+codecuttlectl --list-sessions --pinned
+codecuttlectl --list-sessions --search "auth refactor" --json
 
-# Non-interactive, REPL, or resume a session
-c3 -message "Fix compile errors in ./internal/provider"
-c3 -no-tui
-c3 --list-sessions
-c3 --session ses_abc123
+# Run named morphologies from system, user (~/.config/codecuttlectl/morphs/), or project (.codecuttle/)
+codecuttlectl --list-morphs
+codecuttlectl --morph openrouter-expert-swarm
+
+# Single-model runs (Bedrock default, Ollama, OpenRouter, Google Gemini)
+codecuttlectl --model ollama:qwen3:32b
+codecuttlectl --provider openrouter --model anthropic/claude-3.7-sonnet
+codecuttlectl --provider google --model gemini-2.5-pro
+
+# Non-interactive / scriptable execution
+codecuttlectl -message "Fix compile errors in ./internal/provider"
+codecuttlectl -no-tui
 ```
+
+### In-Session Slash Commands
+
+Within the interactive TUI, manage sessions and tasks with built-in slash commands:
+- `/pin` — Toggle pin status on the active session (prevents pruning).
+- `/alias <name>` or `/alias --clear` — Set or clear a friendly alias.
+- `/title <text>` — Set a custom title for the active session.
+- `/rollover` — Checkpoint and compact the session into a fresh epoch.
+- `/epochs` — View all epoch summaries and ground truth for this session.
+- `/plugins` — List currently loaded Cuttlebone plugins.
 
 ---
 
