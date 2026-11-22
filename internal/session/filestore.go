@@ -5,10 +5,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+var aliasRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// ValidateAlias checks whether an alias string is valid.
+// An empty string is valid (used to clear an alias).
+// A non-empty alias must be 1-64 characters matching ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$
+// and must not begin with the reserved prefix "ses_" (case-insensitive).
+func ValidateAlias(alias string) error {
+	if alias == "" {
+		return nil
+	}
+	if len(alias) > 64 {
+		return fmt.Errorf("alias %q exceeds maximum length of 64 characters", alias)
+	}
+	if strings.HasPrefix(strings.ToLower(alias), "ses_") {
+		return fmt.Errorf("alias %q cannot start with reserved prefix 'ses_'", alias)
+	}
+	if !aliasRegex.MatchString(alias) {
+		return fmt.Errorf("invalid alias %q: must start with an alphanumeric character and contain only alphanumeric characters, dots, underscores, or hyphens (max 64 characters)", alias)
+	}
+	return nil
+}
 
 // DefaultDataDir returns the base directory for session storage,
 // following XDG Base Directory conventions.
@@ -128,7 +151,8 @@ func (fs *FileStore) Load(id string) (*SessionState, error) {
 	return &state, nil
 }
 
-// List returns recent session metadata, sorted by updated_at descending.
+// List returns recent session metadata, sorted with pinned sessions first,
+// then by updated_at descending (most recent first).
 // Only parses the "meta" field for efficiency.
 func (fs *FileStore) List(limit int) ([]SessionMeta, error) {
 	entries, err := os.ReadDir(fs.dir)
@@ -166,8 +190,11 @@ func (fs *FileStore) List(limit int) ([]SessionMeta, error) {
 		metas = append(metas, partial.Meta)
 	}
 
-	// Sort by updated_at descending (most recent first)
+	// Sort with Pinned (true before false) first, then updated_at descending (most recent first)
 	sort.Slice(metas, func(i, j int) bool {
+		if metas[i].Pinned != metas[j].Pinned {
+			return metas[i].Pinned
+		}
 		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
 	})
 
@@ -196,6 +223,7 @@ func (fs *FileStore) Delete(id string) error {
 }
 
 // Prune removes sessions older than maxAge (based on updated_at) and their archived epochs.
+// Pinned sessions are never pruned.
 // Returns the number of sessions deleted.
 func (fs *FileStore) Prune(maxAge time.Duration) (int, error) {
 	entries, err := os.ReadDir(fs.dir)
@@ -230,6 +258,11 @@ func (fs *FileStore) Prune(maxAge time.Duration) (int, error) {
 			continue
 		}
 
+		// Pinned sessions are protected from pruning
+		if partial.Meta.Pinned {
+			continue
+		}
+
 		if partial.Meta.UpdatedAt.Before(cutoff) {
 			if err := os.Remove(filepath.Join(fs.dir, name)); err == nil {
 				deleted++
@@ -240,6 +273,205 @@ func (fs *FileStore) Prune(maxAge time.Duration) (int, error) {
 	}
 
 	return deleted, nil
+}
+
+// ResolveMeta resolves a session by ID or case-insensitive alias and returns its metadata.
+func (fs *FileStore) ResolveMeta(idOrAlias string) (SessionMeta, error) {
+	target := strings.TrimSpace(idOrAlias)
+	if target == "" {
+		return SessionMeta{}, fmt.Errorf("session ID or alias cannot be empty")
+	}
+
+	// If it starts with "ses_" (case-insensitive), treat as canonical session ID
+	if strings.HasPrefix(strings.ToLower(target), "ses_") {
+		state, err := fs.Load(target)
+		if err != nil {
+			return SessionMeta{}, err
+		}
+		return state.Meta, nil
+	}
+
+	// Otherwise, scan session metadata for case-insensitive alias match
+	entries, err := os.ReadDir(fs.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return SessionMeta{}, fmt.Errorf("session with alias %q not found", target)
+		}
+		return SessionMeta{}, fmt.Errorf("listing sessions to resolve alias %q: %w", target, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(fs.dir, name))
+		if err != nil {
+			continue
+		}
+
+		var partial struct {
+			Meta SessionMeta `json:"meta"`
+		}
+		if err := json.Unmarshal(data, &partial); err != nil {
+			continue
+		}
+
+		if partial.Meta.Alias != "" && strings.EqualFold(partial.Meta.Alias, target) {
+			return partial.Meta, nil
+		}
+	}
+
+	return SessionMeta{}, fmt.Errorf("session with alias %q not found", target)
+}
+
+// UpdateMeta modifies the metadata of an existing session using the provided mutator function.
+// It validates any set alias, enforces case-insensitive alias uniqueness across all other sessions,
+// preserves the original UpdatedAt timestamp so metadata edits do not alter recency,
+// and atomically writes the updated state to disk.
+func (fs *FileStore) UpdateMeta(id string, fn func(*SessionMeta) error) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	if fn == nil {
+		return fmt.Errorf("update function cannot be nil")
+	}
+
+	state, err := fs.Load(id)
+	if err != nil {
+		return err
+	}
+
+	origUpdatedAt := state.Meta.UpdatedAt
+
+	if err := fn(&state.Meta); err != nil {
+		return fmt.Errorf("updating session %s meta: %w", id, err)
+	}
+
+	// Validate alias if non-empty
+	if state.Meta.Alias != "" {
+		if err := ValidateAlias(state.Meta.Alias); err != nil {
+			return err
+		}
+
+		// Check uniqueness across other sessions in fs.dir
+		entries, err := os.ReadDir(fs.dir)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("checking alias uniqueness: %w", err)
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
+				continue
+			}
+			otherID := strings.TrimSuffix(name, ".json")
+			if otherID == id {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(fs.dir, name))
+			if err != nil {
+				continue
+			}
+
+			var partial struct {
+				Meta SessionMeta `json:"meta"`
+			}
+			if err := json.Unmarshal(data, &partial); err != nil {
+				continue
+			}
+
+			if partial.Meta.Alias != "" && strings.EqualFold(partial.Meta.Alias, state.Meta.Alias) {
+				return fmt.Errorf("alias %q is already in use by session %s", state.Meta.Alias, otherID)
+			}
+		}
+	}
+
+	// Ensure ID is preserved and restore original UpdatedAt so recency is preserved
+	state.Meta.ID = id
+	state.Meta.UpdatedAt = origUpdatedAt
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling session %s: %w", id, err)
+	}
+
+	target := fs.filePath(id)
+	tmp := target + ".tmp"
+
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("writing session temp file %s: %w", tmp, err)
+	}
+
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("renaming session file %s: %w", target, err)
+	}
+
+	return nil
+}
+
+// FilterSessions filters a slice of SessionMeta according to ListFilter criteria.
+// It supports PinnedOnly, cleaned exact WorkDir match, and case-insensitive substring Query matching
+// against ID, Alias, Title, WorkDir, Model, Morph, or any Tag.
+func FilterSessions(metas []SessionMeta, filter ListFilter) []SessionMeta {
+	if len(metas) == 0 {
+		return []SessionMeta{}
+	}
+
+	targetWorkDir := ""
+	if filter.WorkDir != "" {
+		targetWorkDir = filepath.Clean(filter.WorkDir)
+	}
+
+	q := strings.ToLower(strings.TrimSpace(filter.Query))
+
+	result := make([]SessionMeta, 0, len(metas))
+	for _, m := range metas {
+		if filter.PinnedOnly && !m.Pinned {
+			continue
+		}
+
+		if targetWorkDir != "" {
+			if m.WorkDir == "" || filepath.Clean(m.WorkDir) != targetWorkDir {
+				continue
+			}
+		}
+
+		if q != "" {
+			matched := strings.Contains(strings.ToLower(m.ID), q) ||
+				strings.Contains(strings.ToLower(m.Alias), q) ||
+				strings.Contains(strings.ToLower(m.Title), q) ||
+				strings.Contains(strings.ToLower(m.WorkDir), q) ||
+				strings.Contains(strings.ToLower(m.Model), q) ||
+				strings.Contains(strings.ToLower(m.Morph), q)
+
+			if !matched {
+				for _, tag := range m.Tags {
+					if strings.Contains(strings.ToLower(tag), q) {
+						matched = true
+						break
+					}
+				}
+			}
+
+			if !matched {
+				continue
+			}
+		}
+
+		result = append(result, m)
+	}
+
+	return result
 }
 
 // SaveEpochArchive atomically persists an immutable closed epoch archive

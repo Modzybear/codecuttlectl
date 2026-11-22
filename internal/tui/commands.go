@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Modzybear/codecuttlectl/internal/rollover"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -119,6 +120,122 @@ func NewDefaultCommandRegistry() *CommandRegistry {
 	})
 
 	reg.Register(Command{
+		Name:        "/pin",
+		Usage:       "/pin",
+		Description: "Toggle pin status for the active session",
+		Run: func(m *Model, _ []string) tea.Cmd {
+			if m.store == nil || m.sessionID == "" {
+				m.appendSystemNotice("Error: No active session store or session ID to pin session.", true)
+				return nil
+			}
+			var pinned bool
+			err := m.store.UpdateMeta(m.sessionID, func(meta *session.SessionMeta) error {
+				meta.Pinned = !meta.Pinned
+				pinned = meta.Pinned
+				return nil
+			})
+			if err != nil {
+				m.appendSystemNotice(fmt.Sprintf("Error updating pin status: %v", err), true)
+				return nil
+			}
+			if pinned {
+				m.appendSystemNotice(fmt.Sprintf("★ Session pinned (`%s`).", m.sessionID), false)
+			} else {
+				m.appendSystemNotice(fmt.Sprintf("Session unpinned (`%s`).", m.sessionID), false)
+			}
+			return nil
+		},
+	})
+
+	reg.Register(Command{
+		Name:        "/alias",
+		Usage:       "/alias [name|--clear]",
+		Description: "View, set, or clear a friendly alias for the active session",
+		Run: func(m *Model, args []string) tea.Cmd {
+			if m.store == nil || m.sessionID == "" {
+				m.appendSystemNotice("Error: No active session store or session ID to update alias.", true)
+				return nil
+			}
+			if len(args) == 0 {
+				meta, err := m.store.ResolveMeta(m.sessionID)
+				if err != nil {
+					m.appendSystemNotice(fmt.Sprintf("Error retrieving session metadata: %v", err), true)
+					return nil
+				}
+				if meta.Alias != "" {
+					m.appendSystemNotice(fmt.Sprintf("Current session alias: `%s`\n\nUsage: `/alias <name>` or `/alias --clear`", meta.Alias), false)
+				} else {
+					m.appendSystemNotice("No alias is currently set for this session.\n\nUsage: `/alias <name>` or `/alias --clear`", false)
+				}
+				return nil
+			}
+			arg := strings.TrimSpace(args[0])
+			if arg == "--clear" || strings.EqualFold(arg, "clear") {
+				err := m.store.UpdateMeta(m.sessionID, func(meta *session.SessionMeta) error {
+					meta.Alias = ""
+					return nil
+				})
+				if err != nil {
+					m.appendSystemNotice(fmt.Sprintf("Error clearing session alias: %v", err), true)
+					return nil
+				}
+				m.appendSystemNotice(fmt.Sprintf("Cleared alias for session `%s`.", m.sessionID), false)
+				return nil
+			}
+			if err := session.ValidateAlias(arg); err != nil {
+				m.appendSystemNotice(fmt.Sprintf("Invalid alias `%s`: %v", arg, err), true)
+				return nil
+			}
+			err := m.store.UpdateMeta(m.sessionID, func(meta *session.SessionMeta) error {
+				meta.Alias = arg
+				return nil
+			})
+			if err != nil {
+				m.appendSystemNotice(fmt.Sprintf("Error setting alias `%s`: %v", arg, err), true)
+				return nil
+			}
+			m.appendSystemNotice(fmt.Sprintf("Set session alias to `%s`.", arg), false)
+			return nil
+		},
+	})
+
+	reg.Register(Command{
+		Name:        "/title",
+		Usage:       "/title <text>",
+		Description: "View or set the title for the active session",
+		Run: func(m *Model, args []string) tea.Cmd {
+			if m.store == nil || m.sessionID == "" {
+				m.appendSystemNotice("Error: No active session store or session ID to update title.", true)
+				return nil
+			}
+			if len(args) == 0 {
+				meta, err := m.store.ResolveMeta(m.sessionID)
+				if err != nil {
+					m.appendSystemNotice(fmt.Sprintf("Error retrieving session metadata: %v", err), true)
+					return nil
+				}
+				if meta.Title != "" {
+					m.appendSystemNotice(fmt.Sprintf("Current session title: %s\n\nUsage: `/title <text>`", meta.Title), false)
+				} else {
+					m.appendSystemNotice("No title is currently set for this session.\n\nUsage: `/title <text>`", false)
+				}
+				return nil
+			}
+			titleText := strings.TrimSpace(strings.Join(args, " "))
+			err := m.store.UpdateMeta(m.sessionID, func(meta *session.SessionMeta) error {
+				meta.Title = titleText
+				return nil
+			})
+			if err != nil {
+				m.appendSystemNotice(fmt.Sprintf("Error setting session title: %v", err), true)
+				return nil
+			}
+			m.appendSystemNotice(fmt.Sprintf("Set session title to: %s", titleText), false)
+			return nil
+		},
+	})
+
+	reg.Register(Command{
 		Name:        "/help",
 		Usage:       "/help",
 		Description: "Show available slash commands",
@@ -138,6 +255,13 @@ func (r *CommandRegistry) Register(cmd Command) {
 		r.order = append(r.order, key)
 	}
 	r.commands[key] = cmd
+}
+
+// Get returns the command for a given name if registered.
+func (r *CommandRegistry) Get(name string) (Command, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	cmd, ok := r.commands[key]
+	return cmd, ok
 }
 
 // Dispatch parses text as a slash command and executes it if registered.

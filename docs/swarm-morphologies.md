@@ -99,6 +99,86 @@ topology:
 
 When `topology.rules` is empty or absent, routing is legacy-permissive: any defined target node may be handed off to. Once rules are present, only the explicitly listed source→target edges are allowed and enforce a matching handoff path at runtime.
 
+---
+
+## Managing Local & Project Morphologies
+
+`codecuttlectl` makes it seamless to define, discover, customize, and share swarm morphologies across global, user, and project-local scopes without modifying git-tracked files or maintaining fragile shell aliases.
+
+### Directory Layout & Search Order
+
+When referencing a morphology by name (e.g. `codecuttlectl --morph openrouter-expert-swarm` or via `default_morph` in configuration), `codecuttlectl` resolves the file by searching the following locations in order (checking `.yaml` and `.yml` extensions):
+
+1. **Direct Path**: Absolute or relative file path (e.g. `./my-morph.yaml` or `/opt/morphs/team.yaml`).
+2. **Project Local Morphs**: `<workdir>/.codecuttle/morphs/`
+3. **Custom Configured Morphs Directory**: `morphs_dir` set in `~/.config/codecuttlectl/config.yaml`.
+4. **User Morphologies**: `~/.config/codecuttlectl/morphs/` (or `$XDG_CONFIG_HOME/codecuttlectl/morphs/`).
+5. **System Morphologies**: `/usr/local/share/codecuttlectl/morphs/` (installed by `make install`).
+
+### Full Resolution Precedence
+
+When running `codecuttlectl`, the active morphology is selected using a strict 6-tier precedence hierarchy:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. CLI Flag: --morph <name|path> (or --morph none)          │
+├─────────────────────────────────────────────────────────────┤
+│ 2. Single-Model CLI Override: --provider / --model          │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Resumed Session: Saved morph attribute in session meta   │
+├─────────────────────────────────────────────────────────────┤
+│ 4. Environment Variable: CODECUTTLE_MORPH                   │
+├─────────────────────────────────────────────────────────────┤
+│ 5. Project Default: <workdir>/.codecuttle/morph.yaml        │
+├─────────────────────────────────────────────────────────────┤
+│ 6. User Configuration: default_morph in config.yaml         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **Explicit Flags**: `--morph <name>` or `--morph <path>` takes top priority. Passing `--morph none` disables any ambient default morphology and runs in standard single-agent mode.
+- **Single-Model Fallback**: If an explicit `--provider` or `--model` is supplied on the CLI and `--morph` is omitted, `codecuttlectl` respects the single-model override and will not activate an ambient background morphology.
+- **Resumed Sessions**: Resuming a session (`codecuttlectl -r <alias|id>`) automatically inspects the session metadata and restores the exact morphology originally used.
+- **Environment & Project Overrides**: `CODECUTTLE_MORPH` and repository-level `.codecuttle/morph.yaml` files allow teams to standardize agent setups per project.
+- **User Config Default**: `~/.config/codecuttlectl/config.yaml` provides a persistent user-level default when running outside a project repository.
+
+### Customizing Morphologies Locally
+
+To customize or tweak a system-installed morphology without dirtying the git repository or requiring root permissions, copy it into your user morphs directory:
+
+```bash
+# Ensure user morphs directory exists
+mkdir -p ~/.config/codecuttlectl/morphs
+
+# Copy system starter template
+cp /usr/local/share/codecuttlectl/morphs/openrouter-expert-swarm.yaml ~/.config/codecuttlectl/morphs/
+
+# Edit agent models, prompts, or tools
+$EDITOR ~/.config/codecuttlectl/morphs/openrouter-expert-swarm.yaml
+```
+
+Because `~/.config/codecuttlectl/morphs/` is searched before `/usr/local/share/codecuttlectl/morphs/`, your customized template will automatically shadow the system template when referenced by name.
+
+### Listing Morphologies (`--list-morphs`)
+
+To inspect all available morphologies across all search locations:
+
+```bash
+codecuttlectl --list-morphs
+```
+
+Example output:
+```
+SCOPE     NAME                     NODES  PRIMARY       STATUS            PATH
+------------------------------------------------------------------------------------------
+user      openrouter-expert-swarm      3  orchestrator  active (default)  /home/user/.config/codecuttlectl/morphs/openrouter-expert-swarm.yaml
+system    openrouter-expert-swarm      3  orchestrator  (shadowed)        /usr/local/share/codecuttlectl/morphs/openrouter-expert-swarm.yaml
+system    google-squad                 3  orchestrator  -                 /usr/local/share/codecuttlectl/morphs/google-squad.yaml
+```
+
+- **Shadowing Indicator**: When multiple files share the same base name across different scopes, higher-precedence directories take effect and lower-precedence files are marked as `(shadowed)`.
+- **JSON Output**: Use `codecuttlectl --list-morphs --json` for programmatic inspection in scripts and tooling.
+- **Bundled Starter Templates vs Test Fixtures**: Production starter templates reside in `morphs/` and are installed to `/usr/local/share/codecuttlectl/morphs/`. Test fixtures used exclusively for unit and integration testing remain isolated in `testdata/`.
+
 ## Migration from PR #25 (`ModelPool`)
 
 PR #25 introduced the concept of multi-model routing via a Bedrock-specific `ModelPool` (`Primary`, `Auxiliary`, `Planning`).

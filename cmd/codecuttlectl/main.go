@@ -4,10 +4,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/Modzybear/codecuttlectl/internal/audit"
 	"github.com/Modzybear/codecuttlectl/internal/bedrock"
+	"github.com/Modzybear/codecuttlectl/internal/config"
 	"github.com/Modzybear/codecuttlectl/internal/conversation"
 	"github.com/Modzybear/codecuttlectl/internal/keyring"
 	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
@@ -44,9 +48,9 @@ func main() {
 		openrouterZDR        = flag.Bool("openrouter-zdr", true, "Enable Zero Data Retention (ZDR) on OpenRouter requests (default true, use --openrouter-zdr=false to disable)")
 		openrouterFallbacks  = flag.String("openrouter-fallbacks", "", "Comma-separated list of fallback models for OpenRouter")
 		googleCacheThreshold = flag.Int("google-cache-threshold", 32000, "Token threshold to trigger Google Context Caching API (default 32000)")
-		morphPath            = flag.String("morph", "", "Path to a Swarm Morphology YAML file (overrides model/provider flags)")
+		morphPath            = flag.String("morph", "", "Swarm morphology name, path, or 'none' (overrides model/provider flags)")
 		workDir              = flag.String("workdir", "", "Working directory (default: current directory)")
-		pluginDir            = flag.String("plugin-dir", "", "Directory containing Cuttlebone plugin binaries")
+		pluginDir            = flag.String("plugin-dir", "", "Directory containing Cuttlebone plugin binaries, or 'none' to disable auto-discovery")
 		verbose              = flag.Bool("verbose", false, "Enable verbose/debug output")
 		maxSteps             = flag.Int("max-steps", 0, "Maximum tool-use iterations per turn (0 = unlimited)")
 		thinking             = flag.Bool("thinking", false, "Enable extended thinking/reasoning (model must support it)")
@@ -54,11 +58,18 @@ func main() {
 		noTUI                = flag.Bool("no-tui", false, "Disable TUI, use plain REPL mode")
 
 		// Session management
-		sessionID     = flag.String("session", "", "Resume an existing session by ID")
-		listSessions  = flag.Bool("list-sessions", false, "Show recent sessions and exit")
-		listModels    = flag.Bool("list-models", false, "List available models for the selected provider and exit")
-		sessionLimit  = flag.Int("session-limit", 20, "Number of sessions to show in list")
-		pruneSessions = flag.Int("prune-sessions", 0, "Delete sessions older than N days and exit")
+		sessionID      = flag.String("session", "", "Resume an existing session by ID or alias")
+		resumeFlag     = flag.String("r", "", "Resume an existing session by ID or alias (shorthand for --session)")
+		sessionsShort  = flag.Bool("s", false, "Open interactive session picker (falls back to --list-sessions in non-TTY)")
+		sessionsLong   = flag.Bool("sessions", false, "Open interactive session picker (falls back to --list-sessions in non-TTY)")
+		listSessions   = flag.Bool("list-sessions", false, "Show recent sessions and exit")
+		listPinned     = flag.Bool("pinned", false, "Filter --list-sessions to pinned sessions only")
+		searchSessions = flag.String("search", "", "Filter --list-sessions by substring (ID, alias, title, workdir, model, morph, tags)")
+		jsonOutput     = flag.Bool("json", false, "Output machine-readable JSON (for --list-sessions and --list-morphs)")
+		listMorphs     = flag.Bool("list-morphs", false, "List discoverable swarm morphologies across project, user, and system directories")
+		listModels     = flag.Bool("list-models", false, "List available models for the selected provider and exit")
+		sessionLimit   = flag.Int("session-limit", 20, "Number of sessions to show in list")
+		pruneSessions  = flag.Int("prune-sessions", 0, "Delete sessions older than N days and exit")
 
 		// Safety
 		autoApprove = flag.Bool("auto-approve", false, "Skip confirmation prompts for destructive operations (use in automated pipelines)")
@@ -73,6 +84,17 @@ func main() {
 		maxCost         = flag.Float64("max-cost", 0, "Maximum cumulative session cost in USD before pausing automatic rollover (0 = unlimited)")
 	)
 	flag.Parse()
+
+	explicitFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	userCfg, cfgErr := config.Load()
+	if cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "Error loading configuration: %v\n", cfgErr)
+		os.Exit(1)
+	}
 
 	docsPolicy, err := rollover.ParseDocsPolicy(*rolloverDocs)
 	if err != nil {
@@ -102,6 +124,13 @@ func main() {
 			os.Exit(1)
 		}
 		*workDir = wd
+	} else {
+		expanded := config.ExpandPath(*workDir)
+		if absWD, err := filepath.Abs(expanded); err == nil {
+			*workDir = absWD
+		} else {
+			*workDir = expanded
+		}
 	}
 
 	// Resolve region from env if not specified
@@ -124,22 +153,74 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Handle --list-sessions
-	if *listSessions {
-		runListSessions(store, *sessionLimit)
+	// Early-exit commands: --list-morphs
+	if *listMorphs {
+		runListMorphs(*workDir, userCfg, *jsonOutput)
 		return
 	}
 
-	// Handle --list-models
+	// Early-exit commands: --list-sessions
+	if *listSessions {
+		runListSessions(store, *sessionLimit, session.ListFilter{PinnedOnly: *listPinned, Query: *searchSessions}, *jsonOutput)
+		return
+	}
+
+	// Early-exit commands: --list-models
 	if *listModels {
 		runListModels(*providerF, *modelID)
 		return
 	}
 
-	// Handle --prune-sessions
+	// Early-exit commands: --prune-sessions
 	if *pruneSessions > 0 {
 		runPruneSessions(store, *pruneSessions)
 		return
+	}
+
+	// Early-exit / session picker: -s / --sessions
+	if *sessionsShort || *sessionsLong {
+		if isTTY(os.Stdin) && isTTY(os.Stdout) {
+			res, err := tui.RunSessionPicker(store, *workDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error running session picker: %v\n", err)
+				os.Exit(1)
+			}
+			switch res.Action {
+			case tui.PickerActionQuit:
+				return
+			case tui.PickerActionResume:
+				*sessionID = res.SessionID
+			case tui.PickerActionNew:
+				*sessionID = ""
+			}
+		} else {
+			runListSessions(store, *sessionLimit, session.ListFilter{PinnedOnly: *listPinned, Query: *searchSessions}, *jsonOutput)
+			return
+		}
+	}
+
+	// Normalize -r / --session
+	if *sessionID == "" && *resumeFlag != "" {
+		*sessionID = *resumeFlag
+	}
+
+	var resumedSessionMorph string
+	if *sessionID != "" {
+		meta, err := store.ResolveMeta(*sessionID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving session %q: %v\n", *sessionID, err)
+			os.Exit(1)
+		}
+		*sessionID = meta.ID
+		resumedSessionMorph = meta.Morph
+		if !explicitFlags["workdir"] && meta.WorkDir != "" {
+			if info, statErr := os.Stat(meta.WorkDir); statErr == nil && info.IsDir() {
+				*workDir = meta.WorkDir
+				_ = os.Chdir(meta.WorkDir)
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: session workdir %q not found; staying in %s\n", meta.WorkDir, *workDir)
+			}
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -158,15 +239,33 @@ func main() {
 	var bedrockClient *bedrock.Client // Non-nil only for Bedrock (needed for Bedrock-specific features)
 	var genericPool provider.Pool
 	var morph *swarm.Morphology
+	var sessionMorphSpec string
 	providerName := *providerF
 
-	if *morphPath != "" {
-		var err error
-		morph, err = swarm.LoadMorphology(*morphPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading morphology: %v\n", err)
+	morphRes, err := config.ResolveMorph(config.MorphResolveOptions{
+		FlagValue:               *morphPath,
+		FlagSet:                 explicitFlags["morph"],
+		ExplicitModelOrProvider: explicitFlags["provider"] || explicitFlags["model"],
+		SessionMorph:            resumedSessionMorph,
+		WorkDir:                 *workDir,
+		Config:                  userCfg,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving morphology: %v\n", err)
+		os.Exit(1)
+	}
+	if morphRes.Warning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", morphRes.Warning)
+	}
+
+	if morphRes.Path != "" {
+		var loadErr error
+		morph, loadErr = swarm.LoadMorphology(morphRes.Path)
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "Error loading morphology: %v\n", loadErr)
 			os.Exit(1)
 		}
+		sessionMorphSpec = computeSessionMorphSpec(morphRes, *workDir, userCfg)
 
 		factory := func(ctx context.Context, nodeConfig swarm.Node) (provider.Provider, error) {
 			provName := nodeConfig.Provider
@@ -181,11 +280,6 @@ func main() {
 				if err := keyring.EnsureOpenRouterAPIKey(); err != nil {
 					return nil, fmt.Errorf("failed to ensure OpenRouter API key: %w", err)
 				}
-				// Per-node fallbacks are constructed by swarm.NewPool as separate
-				// local candidates (via FallbackProvider); do NOT also enable
-				// OpenRouter server-side `models` fallback, which could switch
-				// backends before local retries exhaust. Only global CLI fallbacks
-				// remain here for the single-provider, non-morphology path.
 				var fallbacks []string
 				if *openrouterFallbacks != "" {
 					for _, f := range strings.Split(*openrouterFallbacks, ",") {
@@ -207,12 +301,8 @@ func main() {
 					Model:          modID,
 					CacheThreshold: *googleCacheThreshold,
 				})
-				if err == nil {
-					// Add cleanup? (omitted for simple factory)
-				}
 				return client, err
 			case "bedrock":
-				// Create single bedrock client (could optimize by caching session)
 				resolved := bedrock.ResolveModelID(modID)
 				c, err := bedrock.NewClient(ctx, bedrock.Config{
 					Region:  *region,
@@ -235,8 +325,6 @@ func main() {
 		}
 
 		genericPool = pool
-
-		// Map genericPool to legacy components for smooth transition
 		llmProvider = pool.Primary()
 
 		if *verbose {
@@ -351,8 +439,9 @@ func main() {
 	pluginMgr := pluginhost.NewManager(*verbose)
 	defer pluginMgr.Shutdown()
 
-	if *pluginDir != "" {
-		if err := pluginMgr.DiscoverPlugins(ctx, *pluginDir); err != nil {
+	resolvedPluginDir := config.ResolvePluginDir(*pluginDir, explicitFlags["plugin-dir"], userCfg)
+	if resolvedPluginDir != "" {
+		if err := pluginMgr.DiscoverPlugins(ctx, resolvedPluginDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error discovering plugins: %v\n", err)
 			os.Exit(1)
 		}
@@ -393,7 +482,7 @@ func main() {
 
 	// One-shot mode: no TUI, just print result to stdout
 	if *oneShot != "" {
-		runOneShot(ctx, bedrockClient, genericPool, llmProvider, pluginMgr, promptMgr, store, *sessionID, systemPrompt, *workDir, *maxSteps, *verbose, *autoApprove, auditLogger, *oneShot, morph, &rolloverCfg)
+		runOneShot(ctx, bedrockClient, genericPool, llmProvider, pluginMgr, promptMgr, store, *sessionID, systemPrompt, *workDir, *maxSteps, *verbose, *autoApprove, auditLogger, *oneShot, morph, sessionMorphSpec, &rolloverCfg)
 		return
 	}
 
@@ -405,6 +494,7 @@ func main() {
 			Pool:           genericPool,
 			Provider:       llmProvider,
 			Morph:          morph,
+			MorphName:      sessionMorphSpec,
 			PromptMgr:      promptMgr,
 			PluginMgr:      pluginMgr,
 			WorkDir:        *workDir,
@@ -433,6 +523,7 @@ func main() {
 		Pool:           genericPool,
 		Provider:       llmProvider,
 		Morph:          morph,
+		MorphName:      sessionMorphSpec,
 		PromptMgr:      promptMgr,
 		PluginMgr:      pluginMgr,
 		WorkDir:        *workDir,
@@ -470,6 +561,7 @@ func main() {
 		Store:          store,
 		SessionID:      *sessionID,
 		Morph:          morph,
+		MorphName:      sessionMorphSpec,
 		Agent:          agent,
 		Engine:         engine,
 		MaxSteps:       *maxSteps,
@@ -485,17 +577,18 @@ func main() {
 
 	// Print session resume info on exit
 	if fm, ok := finalModel.(tui.Model); ok {
-		printSessionExit(fm.SessionID())
+		printSessionExit(store, fm.SessionID())
 	}
 }
 
 // runOneShot executes a single message and exits (non-TUI, for scripting).
-func runOneShot(ctx context.Context, client *bedrock.Client, pool provider.Pool, llmProvider provider.Provider, pluginMgr *pluginhost.Manager, promptMgr *prompt.Manager, store session.Store, sessionID, system, workDir string, maxSteps int, verbose, autoApprove bool, auditLogger *audit.Logger, message string, morph *swarm.Morphology, rolloverCfg *rollover.Config) {
+func runOneShot(ctx context.Context, client *bedrock.Client, pool provider.Pool, llmProvider provider.Provider, pluginMgr *pluginhost.Manager, promptMgr *prompt.Manager, store session.Store, sessionID, system, workDir string, maxSteps int, verbose, autoApprove bool, auditLogger *audit.Logger, message string, morph *swarm.Morphology, morphName string, rolloverCfg *rollover.Config) {
 	agent, err := conversation.NewAgent(conversation.Config{
 		Client:         client,
 		Pool:           pool,
 		Provider:       llmProvider,
 		Morph:          morph,
+		MorphName:      morphName,
 		PromptMgr:      promptMgr,
 		PluginMgr:      pluginMgr,
 		WorkDir:        workDir,
@@ -554,7 +647,7 @@ func runOneShot(ctx context.Context, client *bedrock.Client, pool provider.Pool,
 	}
 
 	fmt.Println(response)
-	printSessionExit(agent.SessionID())
+	printSessionExit(store, agent.SessionID())
 }
 
 func runPlainREPL(ctx context.Context, agent *conversation.Agent, store session.Store, sessionID, workDir string, verbose, autoApprove bool, auditLogger *audit.Logger) {
@@ -675,51 +768,207 @@ func runPlainREPL(ctx context.Context, agent *conversation.Agent, store session.
 		fmt.Println()
 	}
 
-	printSessionExit(agent.SessionID())
+	printSessionExit(store, agent.SessionID())
 }
 
-// runListSessions prints recent sessions in a table format.
-func runListSessions(store session.Store, limit int) {
-	metas, err := store.List(limit)
+// isTTY reports whether the given file is an interactive terminal character device.
+func isTTY(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	fi, err := f.Stat()
 	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// formatShortWorkDir replaces $HOME with ~ in a directory path for compact display.
+func formatShortWorkDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if dir == home {
+			return "~"
+		}
+		if strings.HasPrefix(dir, home+string(filepath.Separator)) {
+			return "~" + dir[len(home):]
+		}
+	}
+	return dir
+}
+
+// computeSessionMorphSpec determines the canonical morphology identifier for session persistence.
+// If the morphology resolves to a named search path in the project, user, or system directory,
+// it preserves the portable short name; otherwise it returns the absolute file path.
+func computeSessionMorphSpec(morphRes config.MorphResolution, workDir string, userCfg config.Config) string {
+	if morphRes.Path == "" {
+		return ""
+	}
+	targetAbs, err := filepath.Abs(morphRes.Path)
+	if err != nil {
+		targetAbs = morphRes.Path
+	}
+	if morphRes.Name != "" {
+		if lookupPath, _, err := config.LookupMorphPath(morphRes.Name, workDir, userCfg); err == nil {
+			lookupAbs, err := filepath.Abs(lookupPath)
+			if err == nil && filepath.Clean(lookupAbs) == filepath.Clean(targetAbs) {
+				return morphRes.Name
+			}
+		}
+	}
+	return targetAbs
+}
+
+// runListMorphs lists discoverable swarm morphologies.
+func runListMorphs(workDir string, userCfg config.Config, jsonOutput bool) {
+	if err := printMorphsList(os.Stdout, workDir, userCfg, jsonOutput); err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing morphologies: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// printMorphsList outputs the morphologies list as JSON or formatted table to w.
+func printMorphsList(w io.Writer, workDir string, userCfg config.Config, jsonOutput bool) error {
+	morphs, err := config.DiscoverMorphs(workDir, userCfg)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		if morphs == nil {
+			morphs = []config.DiscoveredMorph{}
+		}
+		data, err := json.MarshalIndent(morphs, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(w, string(data))
+		return nil
+	}
+
+	if len(morphs) == 0 {
+		fmt.Fprintln(w, "No morphologies found.")
+		return nil
+	}
+
+	activeRes, _ := config.ResolveMorph(config.MorphResolveOptions{WorkDir: workDir, Config: userCfg})
+
+	nameWidth := 16
+	for _, m := range morphs {
+		if len(m.Name) > nameWidth {
+			nameWidth = len(m.Name)
+		}
+	}
+	rowFmt := fmt.Sprintf("%%-8s  %%-%ds  %%5s  %%-12s  %%-16s  %%s\n", nameWidth)
+	fmt.Fprintf(w, rowFmt, "SCOPE", "NAME", "NODES", "PRIMARY", "STATUS", "PATH")
+	fmt.Fprintln(w, strings.Repeat("-", 74+nameWidth))
+
+	for _, m := range morphs {
+		nodeStr := fmt.Sprintf("%d", m.NodeCount)
+		primaryStr := m.PrimaryNode
+		status := "-"
+		if m.ParseErr != "" {
+			status = "invalid"
+			nodeStr = "-"
+			primaryStr = "-"
+		} else if m.Shadowed {
+			status = "(shadowed)"
+		} else if activeRes.Path != "" && filepath.Clean(m.Path) == filepath.Clean(activeRes.Path) {
+			status = "active (default)"
+		}
+
+		fmt.Fprintf(w, rowFmt,
+			m.Scope, m.Name, nodeStr, primaryStr, status, m.Path)
+	}
+	return nil
+}
+
+// runListSessions prints recent sessions in a table format or JSON.
+func runListSessions(store session.Store, limit int, filter session.ListFilter, jsonOutput bool) {
+	if err := printSessionsList(os.Stdout, store, limit, filter, jsonOutput); err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing sessions: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	if len(metas) == 0 {
-		fmt.Println("No sessions found.")
-		return
+// printSessionsList outputs sessions filtered by ListFilter to w.
+func printSessionsList(w io.Writer, store session.Store, limit int, filter session.ListFilter, jsonOutput bool) error {
+	metas, err := store.List(0)
+	if err != nil {
+		return err
 	}
 
-	fmt.Printf("%-14s %-30s %-20s %6s %8s %7s %s\n",
-		"ID", "TITLE", "MODEL", "TURNS", "TOKENS", "COST", "AGE")
-	fmt.Println(strings.Repeat("-", 110))
+	metas = session.FilterSessions(metas, filter)
+	if limit > 0 && len(metas) > limit {
+		metas = metas[:limit]
+	}
+
+	if jsonOutput {
+		if metas == nil {
+			metas = []session.SessionMeta{}
+		}
+		data, err := json.MarshalIndent(metas, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(w, string(data))
+		return nil
+	}
+
+	if len(metas) == 0 {
+		fmt.Fprintln(w, "No sessions found.")
+		return nil
+	}
+
+	fmt.Fprintf(w, "%-3s  %-24s  %-24s  %-5s  %-20s  %-18s  %7s  %s\n",
+		"PIN", "ALIAS / ID", "TITLE", "EPOCH", "WORKDIR", "MODEL", "COST", "AGE")
+	fmt.Fprintln(w, strings.Repeat("-", 120))
 
 	for _, m := range metas {
+		pin := " "
+		if m.Pinned {
+			pin = "★"
+		}
+		idStr := m.ID
+		if m.Alias != "" {
+			idStr = fmt.Sprintf("%s (%s)", m.Alias, m.ID)
+		}
+		idStr = truncateDisplay(idStr, 24)
 		title := m.Title
 		if title == "" {
 			title = "(untitled)"
 		}
-		if len(title) > 28 {
-			title = title[:28] + ".."
-		}
-
-		model := m.Model
-		if len(model) > 18 {
-			model = model[:18] + ".."
-		}
-
-		age := formatAge(m.UpdatedAt)
-		totalIn := m.Stats.InputTokens + m.Stats.CacheReadInputTokens + m.Stats.CacheWriteInputTokens
-		tokens := totalIn + m.Stats.OutputTokens
+		title = truncateDisplay(title, 24)
+		epochStr := fmt.Sprintf("E%d", m.EffectiveEpoch())
+		wd := truncateDisplay(formatShortWorkDir(m.WorkDir), 20)
+		model := truncateDisplay(m.Model, 18)
 		cost := fmt.Sprintf("$%.2f", m.Stats.EstimatedCostUSD)
+		age := formatAge(m.UpdatedAt)
 
-		fmt.Printf("%-14s %-30s %-20s %6d %8d %7s %s\n",
-			m.ID, title, model, m.Stats.Turns, tokens, cost, age)
+		fmt.Fprintf(w, "%-3s  %-24s  %-24s  %-5s  %-20s  %-18s  %7s  %s\n",
+			pin, idStr, title, epochStr, wd, model, cost, age)
 	}
+	return nil
 }
 
-// runPruneSessions removes old sessions.
+// truncateDisplay truncates a string by UTF-8 rune count (never splitting multi-byte runes).
+func truncateDisplay(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 2 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-2]) + ".."
+}
+
+// runPruneSessions removes old sessions, preserving pinned sessions.
 func runPruneSessions(store session.Store, days int) {
 	maxAge := time.Duration(days) * 24 * time.Hour
 	deleted, err := store.Prune(maxAge)
@@ -727,7 +976,7 @@ func runPruneSessions(store session.Store, days int) {
 		fmt.Fprintf(os.Stderr, "Error pruning sessions: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Pruned %d session(s) older than %d days.\n", deleted, days)
+	fmt.Printf("Pruned %d session(s) older than %d days (pinned sessions preserved).\n", deleted, days)
 }
 
 // runListModels lists available models for the given provider.
@@ -799,9 +1048,15 @@ func runListGoogleModels() {
 	}
 }
 
-// formatAge returns a human-readable age string.
+// formatAge formats a timestamp as a human-readable relative age.
 func formatAge(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
 	d := time.Since(t)
+	if d < 0 {
+		return "just now"
+	}
 	switch {
 	case d < time.Minute:
 		return "just now"
@@ -819,10 +1074,19 @@ func formatAge(t time.Time) string {
 }
 
 // printSessionExit prints session resume info to stderr on exit.
-func printSessionExit(sessionID string) {
+func printSessionExit(store session.Store, sessionID string) {
 	if sessionID == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nSession: %s\n", sessionID)
-	fmt.Fprintf(os.Stderr, "Resume:  codecuttlectl --session %s\n", sessionID)
+	var alias string
+	if store != nil {
+		if meta, err := store.ResolveMeta(sessionID); err == nil && meta.Alias != "" {
+			alias = meta.Alias
+		}
+	}
+	if alias != "" {
+		fmt.Fprintf(os.Stderr, "\nResume with: codecuttlectl -r %s (id: %s)\n", alias, sessionID)
+	} else {
+		fmt.Fprintf(os.Stderr, "\nResume with: codecuttlectl -r %s\n", sessionID)
+	}
 }

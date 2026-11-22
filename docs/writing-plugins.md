@@ -287,17 +287,58 @@ The orchestrator provides:
 - **Process isolation**: Panics/OOM in your plugin never crash the orchestrator
 - **Input validation**: Schema validation before execution catches malformed LLM output early
 
-### Building and Installing
+### Building and Installing Plugins
+
+#### Repository-Wide Build & Install
+When developing in the `codecuttlectl` source repository, you can compile and install all plugins atomically:
 
 ```bash
-# Build
+# Build all plugins into ./bin/plugins/
+make build-plugins
+
+# Atomically install all plugins into /usr/local/lib/codecuttlectl/plugins/
+sudo make install-plugins
+
+# Or build and install CLI, plugins, and starter morphs together
+sudo make install
+```
+
+#### Individual Plugin Build
+To build an individual plugin manually:
+
+```bash
+# Build standalone binary
 go build -trimpath -ldflags="-s -w" -o cuttlebone-my-tool ./plugins/cuttlebone-my-tool/
 
-# Install
-sudo cp cuttlebone-my-tool /usr/local/lib/codecuttlectl/plugins/
+# Install to user plugin directory (no root required)
+mkdir -p ~/.local/lib/codecuttlectl/plugins
+cp cuttlebone-my-tool ~/.local/lib/codecuttlectl/plugins/
 
-# Verify (next c3 invocation will discover it)
-c3 -message "Use tool_info to list all tools"
+# Or install system-wide
+sudo cp cuttlebone-my-tool /usr/local/lib/codecuttlectl/plugins/
+```
+
+### Automatic Plugin Discovery
+
+`codecuttlectl` features zero-configuration automatic plugin discovery. You do not need to configure shell aliases or explicitly pass `-plugin-dir` if plugins are installed in standard locations.
+
+The plugin directory is resolved in the following order:
+
+1. **CLI Flag**: `-plugin-dir <path>` (pass `-plugin-dir none` to explicitly disable plugin discovery).
+2. **Environment Variable**: `CODECUTTLE_PLUGIN_DIR` (or `CODECUTTLE_PLUGIN_DIR=none`).
+3. **User Configuration**: `plugin_dir` field in `~/.config/codecuttlectl/config.yaml`.
+4. **Auto-Detection**: Scans the following candidate directories in order and uses the first directory containing `cuttlebone-*` executables:
+   - `~/.local/share/codecuttlectl/plugins` (respects `$XDG_DATA_HOME/codecuttlectl/plugins`)
+   - `~/.local/lib/codecuttlectl/plugins`
+   - `/usr/local/lib/codecuttlectl/plugins`
+
+To verify which plugins are loaded in any session:
+```bash
+# In interactive TUI
+/plugins
+
+# Or verify via built-in tool info
+codecuttlectl -message "Use tool_info to list all tools"
 ```
 
 ### Scaffold Generator

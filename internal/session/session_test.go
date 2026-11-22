@@ -1797,3 +1797,462 @@ func TestMessageAndContentItemZeroTimestampOmission(t *testing.T) {
 		t.Fatalf("restored timestamp mismatch: msg=%v block=%v want=%v", restored.Timestamp, restored.Blocks[0].Timestamp, now)
 	}
 }
+
+// --- Alias Validation, Meta Updates, Resolution, and Filtering Tests ---
+
+func TestValidateAlias(t *testing.T) {
+	tests := []struct {
+		name    string
+		alias   string
+		wantErr bool
+	}{
+		{"empty alias is valid", "", false},
+		{"simple lowercase", "my-session", false},
+		{"mixed case and numbers", "Feature123", false},
+		{"dots and underscores", "v1.2.3_patch-4", false},
+		{"single character", "a", false},
+		{"single digit", "1", false},
+		{"64 characters valid", strings.Repeat("a", 64), false},
+		{"65 characters invalid", strings.Repeat("a", 65), true},
+		{"starts with ses_ lowercase", "ses_1234", true},
+		{"starts with SES_ uppercase", "SES_MY_ALIAS", true},
+		{"starts with Ses_ mixed case", "Ses_project", true},
+		{"starts with dash", "-invalid", true},
+		{"starts with dot", ".invalid", true},
+		{"starts with underscore", "_invalid", true},
+		{"contains space", "my alias", true},
+		{"contains slash", "my/alias", true},
+		{"contains backslash", "my\\alias", true},
+		{"contains special symbol", "my@alias", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAlias(tt.alias)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateAlias(%q) err = %v, wantErr %v", tt.alias, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestUpdateMeta(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	initialTime := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
+	meta1 := SessionMeta{
+		Title:     "Session 1",
+		Model:     "bedrock:claude-3-5-sonnet",
+		CreatedAt: initialTime,
+		UpdatedAt: initialTime,
+	}
+	id1, err := fs.Create(meta1)
+	if err != nil {
+		t.Fatalf("Create id1: %v", err)
+	}
+
+	// Backdate state explicitly to ensure initialTime is set
+	state1, _ := fs.Load(id1)
+	state1.Meta.UpdatedAt = initialTime
+	_ = os.WriteFile(fs.filePath(id1), []byte(mustJSON(t, state1)), 0600)
+
+	// 1. Toggle Pinned and set Alias, verify UpdatedAt is preserved
+	err = fs.UpdateMeta(id1, func(m *SessionMeta) error {
+		m.Pinned = true
+		m.Alias = "project-alpha"
+		m.Morph = "architect"
+		m.Tags = []string{"core", "api"}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateMeta id1: %v", err)
+	}
+
+	updated1, err := fs.Load(id1)
+	if err != nil {
+		t.Fatalf("Load updated id1: %v", err)
+	}
+	if !updated1.Meta.Pinned {
+		t.Errorf("expected Pinned = true")
+	}
+	if updated1.Meta.Alias != "project-alpha" {
+		t.Errorf("expected Alias 'project-alpha', got %q", updated1.Meta.Alias)
+	}
+	if updated1.Meta.Morph != "architect" {
+		t.Errorf("expected Morph 'architect', got %q", updated1.Meta.Morph)
+	}
+	if !reflect.DeepEqual(updated1.Meta.Tags, []string{"core", "api"}) {
+		t.Errorf("expected Tags [core, api], got %v", updated1.Meta.Tags)
+	}
+	if !updated1.Meta.UpdatedAt.Equal(initialTime) {
+		t.Errorf("expected UpdatedAt %v preserved, got %v", initialTime, updated1.Meta.UpdatedAt)
+	}
+
+	// 2. Create Session 2
+	id2, err := fs.Create(SessionMeta{Title: "Session 2"})
+	if err != nil {
+		t.Fatalf("Create id2: %v", err)
+	}
+
+	// 3. Attempt duplicate alias (case-insensitive) on Session 2 -> must fail naming id1
+	err = fs.UpdateMeta(id2, func(m *SessionMeta) error {
+		m.Alias = "PROJECT-ALPHA"
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected duplicate alias error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already in use") || !strings.Contains(err.Error(), id1) {
+		t.Fatalf("expected error naming session %s, got: %v", id1, err)
+	}
+
+	// 4. Session 1 can re-save its own alias without error
+	err = fs.UpdateMeta(id1, func(m *SessionMeta) error {
+		m.Title = "Updated Title"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("re-saving own alias failed: %v", err)
+	}
+
+	// 5. Clear alias on Session 1
+	err = fs.UpdateMeta(id1, func(m *SessionMeta) error {
+		m.Alias = ""
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("clearing alias failed: %v", err)
+	}
+
+	// 6. Now Session 2 can take "project-alpha"
+	err = fs.UpdateMeta(id2, func(m *SessionMeta) error {
+		m.Alias = "project-alpha"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("setting released alias on session 2 failed: %v", err)
+	}
+
+	// 7. Error cases
+	if err := fs.UpdateMeta("ses_nonexistent", func(m *SessionMeta) error { return nil }); err == nil {
+		t.Errorf("expected error for non-existent session")
+	}
+	if err := fs.UpdateMeta(id1, nil); err == nil {
+		t.Errorf("expected error for nil fn")
+	}
+}
+
+func TestResolveMeta(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	id1, err := fs.Create(SessionMeta{Title: "Canonical ID Session"})
+	if err != nil {
+		t.Fatalf("Create id1: %v", err)
+	}
+
+	id2, err := fs.Create(SessionMeta{Title: "Aliased Session"})
+	if err != nil {
+		t.Fatalf("Create id2: %v", err)
+	}
+	if err := fs.UpdateMeta(id2, func(m *SessionMeta) error {
+		m.Alias = "deploy-bot"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateMeta alias: %v", err)
+	}
+
+	// 1. Resolve by canonical ID (exact and with spaces)
+	meta, err := fs.ResolveMeta(id1)
+	if err != nil {
+		t.Fatalf("ResolveMeta(id1) error: %v", err)
+	}
+	if meta.ID != id1 || meta.Title != "Canonical ID Session" {
+		t.Fatalf("unexpected meta for id1: %+v", meta)
+	}
+
+	meta, err = fs.ResolveMeta("  " + id1 + "  ")
+	if err != nil {
+		t.Fatalf("ResolveMeta trimmed id1 error: %v", err)
+	}
+	if meta.ID != id1 {
+		t.Fatalf("unexpected meta ID: %s", meta.ID)
+	}
+
+	// 2. Resolve by alias (exact and case-insensitive)
+	meta, err = fs.ResolveMeta("deploy-bot")
+	if err != nil {
+		t.Fatalf("ResolveMeta('deploy-bot') error: %v", err)
+	}
+	if meta.ID != id2 || meta.Alias != "deploy-bot" {
+		t.Fatalf("unexpected meta for alias: %+v", meta)
+	}
+
+	meta, err = fs.ResolveMeta("DEPLOY-BOT")
+	if err != nil {
+		t.Fatalf("ResolveMeta('DEPLOY-BOT') error: %v", err)
+	}
+	if meta.ID != id2 {
+		t.Fatalf("unexpected meta ID for case-insensitive alias: %s", meta.ID)
+	}
+
+	// 3. Error cases
+	if _, err := fs.ResolveMeta("ses_nonexistent"); err == nil {
+		t.Errorf("expected error for non-existent session ID")
+	}
+	if _, err := fs.ResolveMeta("nonexistent-alias"); err == nil {
+		t.Errorf("expected error for non-existent alias")
+	}
+	if _, err := fs.ResolveMeta("   "); err == nil {
+		t.Errorf("expected error for empty string")
+	}
+}
+
+func TestListSortingWithPinned(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	base := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+
+	// Create 4 sessions:
+	// s1: unpinned, t4 (most recent unpinned)
+	// s2: pinned, t2 (older pinned)
+	// s3: pinned, t3 (newer pinned)
+	// s4: unpinned, t1 (oldest unpinned)
+
+	s1ID, _ := fs.Create(SessionMeta{Title: "Unpinned Recent"})
+	setSessionTimeAndPin(t, fs, s1ID, base.Add(4*time.Hour), false)
+
+	s2ID, _ := fs.Create(SessionMeta{Title: "Pinned Older"})
+	setSessionTimeAndPin(t, fs, s2ID, base.Add(2*time.Hour), true)
+
+	s3ID, _ := fs.Create(SessionMeta{Title: "Pinned Newer"})
+	setSessionTimeAndPin(t, fs, s3ID, base.Add(3*time.Hour), true)
+
+	s4ID, _ := fs.Create(SessionMeta{Title: "Unpinned Oldest"})
+	setSessionTimeAndPin(t, fs, s4ID, base.Add(1*time.Hour), false)
+
+	// List all
+	metas, err := fs.List(10)
+	if err != nil {
+		t.Fatalf("List error: %v", err)
+	}
+	if len(metas) != 4 {
+		t.Fatalf("expected 4 sessions, got %d", len(metas))
+	}
+
+	// Pinned should come first sorted by UpdatedAt desc (s3 then s2), then unpinned sorted by UpdatedAt desc (s1 then s4)
+	expectedOrder := []string{s3ID, s2ID, s1ID, s4ID}
+	for i, wantID := range expectedOrder {
+		if metas[i].ID != wantID {
+			t.Errorf("metas[%d] = %s (pinned=%v, title=%s), want %s", i, metas[i].ID, metas[i].Pinned, metas[i].Title, wantID)
+		}
+	}
+
+	// List with limit=2 should return both pinned sessions and NOT evict them
+	top2, err := fs.List(2)
+	if err != nil {
+		t.Fatalf("List(2) error: %v", err)
+	}
+	if len(top2) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(top2))
+	}
+	if top2[0].ID != s3ID || top2[1].ID != s2ID {
+		t.Fatalf("expected pinned sessions [%s, %s], got [%s, %s]", s3ID, s2ID, top2[0].ID, top2[1].ID)
+	}
+}
+
+func TestPrunePreservesPinnedSessions(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	now := time.Now().UTC()
+	oldTime := now.Add(-10 * 24 * time.Hour)
+	recentTime := now.Add(-1 * time.Hour)
+
+	// s1: unpinned, old -> should be pruned
+	s1, _ := fs.Create(SessionMeta{Title: "Old Unpinned"})
+	setSessionTimeAndPin(t, fs, s1, oldTime, false)
+
+	// s2: pinned, old -> should be PRESERVED
+	s2, _ := fs.Create(SessionMeta{Title: "Old Pinned"})
+	setSessionTimeAndPin(t, fs, s2, oldTime, true)
+
+	// s3: unpinned, recent -> should be PRESERVED
+	s3, _ := fs.Create(SessionMeta{Title: "Recent Unpinned"})
+	setSessionTimeAndPin(t, fs, s3, recentTime, false)
+
+	deleted, err := fs.Prune(5 * 24 * time.Hour)
+	if err != nil {
+		t.Fatalf("Prune error: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("Prune deleted %d sessions, want 1", deleted)
+	}
+
+	if _, err := fs.Load(s1); err == nil {
+		t.Errorf("expected session s1 (unpinned old) to be pruned")
+	}
+	if _, err := fs.Load(s2); err != nil {
+		t.Errorf("expected session s2 (pinned old) to be preserved: %v", err)
+	}
+	if _, err := fs.Load(s3); err != nil {
+		t.Errorf("expected session s3 (recent unpinned) to be preserved: %v", err)
+	}
+}
+
+func TestFilterSessions(t *testing.T) {
+	metas := []SessionMeta{
+		{
+			ID:      "ses_0001",
+			Alias:   "auth-service",
+			Title:   "Fix authentication tokens",
+			Model:   "openrouter:anthropic/claude-3-7-sonnet",
+			Morph:   "deep_coder",
+			WorkDir: "/workspace/backend",
+			Pinned:  true,
+			Tags:    []string{"security", "auth", "v1"},
+		},
+		{
+			ID:      "ses_0002",
+			Alias:   "frontend-ui",
+			Title:   "Redesign navbar component",
+			Model:   "openrouter:google/gemini-2.5-flash",
+			Morph:   "ui_specialist",
+			WorkDir: "/workspace/frontend",
+			Pinned:  false,
+			Tags:    []string{"ui", "react"},
+		},
+		{
+			ID:      "ses_0003",
+			Alias:   "infra-deploy",
+			Title:   "Setup Terraform and AWS",
+			Model:   "openrouter:anthropic/claude-3-7-sonnet",
+			Morph:   "devops",
+			WorkDir: "/workspace/backend",
+			Pinned:  true,
+			Tags:    []string{"infra", "terraform"},
+		},
+	}
+
+	// 1. PinnedOnly
+	pinned := FilterSessions(metas, ListFilter{PinnedOnly: true})
+	if len(pinned) != 2 || pinned[0].ID != "ses_0001" || pinned[1].ID != "ses_0003" {
+		t.Errorf("PinnedOnly failed: got %v", pinned)
+	}
+
+	// 2. WorkDir (exact, cleaned path)
+	backend := FilterSessions(metas, ListFilter{WorkDir: "/workspace/backend/."})
+	if len(backend) != 2 || backend[0].ID != "ses_0001" || backend[1].ID != "ses_0003" {
+		t.Errorf("WorkDir filter failed: got %v", backend)
+	}
+
+	frontend := FilterSessions(metas, ListFilter{WorkDir: "/workspace/frontend"})
+	if len(frontend) != 1 || frontend[0].ID != "ses_0002" {
+		t.Errorf("WorkDir filter frontend failed: got %v", frontend)
+	}
+
+	// 3. Query match across fields
+	// Query ID
+	res := FilterSessions(metas, ListFilter{Query: "0002"})
+	if len(res) != 1 || res[0].ID != "ses_0002" {
+		t.Errorf("Query ID failed: got %v", res)
+	}
+
+	// Query Alias
+	res = FilterSessions(metas, ListFilter{Query: "AUTH-SERVICE"})
+	if len(res) != 1 || res[0].ID != "ses_0001" {
+		t.Errorf("Query Alias failed: got %v", res)
+	}
+
+	// Query Title
+	res = FilterSessions(metas, ListFilter{Query: "navbar"})
+	if len(res) != 1 || res[0].ID != "ses_0002" {
+		t.Errorf("Query Title failed: got %v", res)
+	}
+
+	// Query Model
+	res = FilterSessions(metas, ListFilter{Query: "gemini"})
+	if len(res) != 1 || res[0].ID != "ses_0002" {
+		t.Errorf("Query Model failed: got %v", res)
+	}
+
+	// Query Morph
+	res = FilterSessions(metas, ListFilter{Query: "DEVOPS"})
+	if len(res) != 1 || res[0].ID != "ses_0003" {
+		t.Errorf("Query Morph failed: got %v", res)
+	}
+
+	// Query Tag
+	res = FilterSessions(metas, ListFilter{Query: "security"})
+	if len(res) != 1 || res[0].ID != "ses_0001" {
+		t.Errorf("Query Tag failed: got %v", res)
+	}
+
+	// Query WorkDir substring
+	res = FilterSessions(metas, ListFilter{Query: "backend"})
+	if len(res) != 2 {
+		t.Errorf("Query WorkDir substring failed: got %d results", len(res))
+	}
+
+	// Combined PinnedOnly + WorkDir + Query
+	res = FilterSessions(metas, ListFilter{
+		PinnedOnly: true,
+		WorkDir:    "/workspace/backend",
+		Query:      "terraform",
+	})
+	if len(res) != 1 || res[0].ID != "ses_0003" {
+		t.Errorf("Combined filter failed: got %v", res)
+	}
+
+	// No match returns empty slice
+	res = FilterSessions(metas, ListFilter{Query: "nonexistent-query-string"})
+	if res == nil || len(res) != 0 {
+		t.Errorf("expected empty non-nil slice, got %v", res)
+	}
+
+	// Empty input slice
+	res = FilterSessions(nil, ListFilter{Query: "test"})
+	if res == nil || len(res) != 0 {
+		t.Errorf("expected empty non-nil slice for nil metas, got %v", res)
+	}
+}
+
+func mustJSON(t *testing.T, v interface{}) string {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("mustJSON: %v", err)
+	}
+	return string(data)
+}
+
+func setSessionTimeAndPin(t *testing.T, fs *FileStore, id string, updatedAt time.Time, pinned bool) {
+	t.Helper()
+	state, err := fs.Load(id)
+	if err != nil {
+		t.Fatalf("setSessionTimeAndPin load: %v", err)
+	}
+	state.Meta.UpdatedAt = updatedAt
+	state.Meta.Pinned = pinned
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatalf("setSessionTimeAndPin marshal: %v", err)
+	}
+	if err := os.WriteFile(fs.filePath(id), data, 0600); err != nil {
+		t.Fatalf("setSessionTimeAndPin write: %v", err)
+	}
+}

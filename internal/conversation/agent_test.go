@@ -612,3 +612,95 @@ func TestLoadSessionSanitizesLegacyUnsignedGeminiToolCalls(t *testing.T) {
 		t.Fatalf("expected transcoded prior tool call/result in Agent.provHistory, got %+v", a.provHistory)
 	}
 }
+
+func TestAgent_MorphNamePersistence(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test 1: InitSession sets meta.Morph from MorphName
+	agent, err := NewAgent(Config{
+		Provider:  &scriptedConverseProvider{id: "mock"},
+		Store:     store,
+		MorphName: "custom-morph",
+		WorkDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sid, err := agent.InitSession("mock", "us-west-2", "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := store.Load(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Meta.Morph != "custom-morph" {
+		t.Errorf("expected state.Meta.Morph = 'custom-morph', got %q", state.Meta.Morph)
+	}
+
+	// Test 2: Fallback to cfg.Morph.Name when MorphName is empty
+	morph := &swarm.Morphology{
+		Name: "fallback-morph",
+		Nodes: map[string]swarm.Node{
+			"primary": {IsPrimary: true},
+		},
+	}
+	agentFallback, err := NewAgent(Config{
+		Provider: &scriptedConverseProvider{id: "mock"},
+		Store:    store,
+		Morph:    morph,
+		WorkDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid2, err := agentFallback.InitSession("mock", "us-west-2", "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state2, err := store.Load(sid2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state2.Meta.Morph != "fallback-morph" {
+		t.Errorf("expected state2.Meta.Morph = 'fallback-morph', got %q", state2.Meta.Morph)
+	}
+
+	// Test 3: Backfill on flushSessionProvider when existing session had empty Morph
+	legacyID := "ses_legacy_morph"
+	if err := store.Save(legacyID, &session.SessionState{
+		Meta: session.SessionMeta{
+			ID:    legacyID,
+			Model: "mock",
+			Morph: "", // empty legacy session
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	agentResumed, err := NewAgent(Config{
+		Provider:  &scriptedConverseProvider{id: "mock"},
+		Store:     store,
+		SessionID: legacyID,
+		MorphName: "resumed-morph",
+		WorkDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentResumed.flushSessionProvider()
+
+	stateResumed, err := store.Load(legacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateResumed.Meta.Morph != "resumed-morph" {
+		t.Errorf("expected backfilled state.Meta.Morph = 'resumed-morph', got %q", stateResumed.Meta.Morph)
+	}
+}
+

@@ -18,16 +18,24 @@ type Store interface {
 	// Load retrieves the full session state by ID.
 	Load(id string) (*SessionState, error)
 
-	// List returns recent session metadata, sorted by updated_at descending.
-	// The limit parameter controls the maximum number of results.
+	// List returns recent session metadata, sorted with pinned sessions first,
+	// then by updated_at descending. The limit parameter controls the maximum number of results.
 	List(limit int) ([]SessionMeta, error)
 
 	// Delete removes a session from storage.
 	Delete(id string) error
 
 	// Prune removes sessions older than maxAge (based on updated_at).
+	// Pinned sessions are never pruned.
 	// Returns the number of sessions deleted.
 	Prune(maxAge time.Duration) (int, error)
+
+	// ResolveMeta resolves a session by ID or case-insensitive alias and returns its metadata.
+	ResolveMeta(idOrAlias string) (SessionMeta, error)
+
+	// UpdateMeta safely modifies session metadata via a callback, validates alias uniqueness,
+	// preserves UpdatedAt recency, and atomically saves the changes.
+	UpdateMeta(id string, fn func(*SessionMeta) error) error
 
 	// SaveEpochArchive atomically persists an immutable closed epoch archive
 	// and returns its relative archive path (e.g. "epochs/ses_abc12345/epoch-001.json").

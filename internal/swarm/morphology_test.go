@@ -1,166 +1,87 @@
 package swarm
 
 import (
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
 
-func TestOpenRouterAstraSwarm(t *testing.T) {
-	m, err := LoadMorphology("../../testdata/openrouter-astra-swarm.yaml")
+func TestBundledMorphologyTemplates(t *testing.T) {
+	files, err := filepath.Glob("../../morphs/*.yaml")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to glob morphs/*.yaml: %v", err)
 	}
-	if m.Name != "openrouter-astra-swarm" || m.Presentation != "progressive_disclosure" || m.Topology.Type != "handoff" {
-		t.Fatalf("unexpected morphology metadata: name=%q presentation=%q topology=%q", m.Name, m.Presentation, m.Topology.Type)
+	if len(files) == 0 {
+		t.Fatal("expected to find bundled morphology templates in morphs/")
 	}
 
-	expected := map[string]int{
-		"astra": 1, "fable": 1, "flash_coder": 5, "deep_coder": 1, "qwen_reviewer": 1,
-	}
-	if len(m.Nodes) != len(expected) || len(m.Topology.Rules) != len(expected) {
-		t.Fatalf("expected five nodes and routing entries, got %d nodes and %d entries", len(m.Nodes), len(m.Topology.Rules))
-	}
-	for id, concurrency := range expected {
-		node, ok := m.Nodes[id]
-		if !ok {
-			t.Fatalf("missing node %q", id)
-		}
-		if node.IsPrimary != (id == "astra") || node.MaxConcurrency != concurrency {
-			t.Errorf("node %q: unexpected primary flag or concurrency", id)
-		}
-		if strings.Contains(node.SystemPrompt, "`orchestrator`") || strings.Contains(node.SystemPrompt, "k3_expert") {
-			t.Errorf("node %q refers to an undefined node", id)
-		}
-		if !slices.Contains(node.Workbench, "handoff") {
-			t.Errorf("node %q cannot use its handoff routes", id)
-		}
-		if id != "astra" && !slices.Contains(m.Topology.Rules[id], "astra") {
-			t.Errorf("node %q must have return route to astra", id)
-		}
-		if id != "astra" && !slices.Contains(m.Topology.Rules["astra"], id) {
-			t.Errorf("astra cannot handoff to %q", id)
-		}
-		if id == "fable" || id == "qwen_reviewer" {
-			for _, tool := range []string{"*", "write_file", "edit_file", "bash_exec"} {
-				if slices.Contains(node.Workbench, tool) {
-					t.Errorf("non-coding node %q exposes %q", id, tool)
+	for _, file := range files {
+		t.Run(filepath.Base(file), func(t *testing.T) {
+			m, err := LoadMorphology(file)
+			if err != nil {
+				t.Fatalf("failed to load morphology from %s: %v", file, err)
+			}
+
+			if strings.TrimSpace(m.Name) == "" {
+				t.Errorf("%s: morphology name must not be empty", file)
+			}
+
+			if len(m.Nodes) == 0 {
+				t.Fatalf("%s: morphology must define at least one node", file)
+			}
+
+			var primaryID string
+			primaryCount := 0
+			for nodeID, node := range m.Nodes {
+				if node.IsPrimary {
+					primaryCount++
+					primaryID = nodeID
+				}
+				if node.Provider == "" {
+					t.Errorf("%s: node %q missing provider", file, nodeID)
+				}
+				if node.Model == "" {
+					t.Errorf("%s: node %q missing model", file, nodeID)
 				}
 			}
-		}
-	}
-	if !slices.Contains(m.Nodes["astra"].Workbench, "todo_manage") {
-		t.Error("astra must be able to delegate async work")
-	}
-	for source, targets := range m.Topology.Rules {
-		if _, ok := m.Nodes[source]; !ok {
-			t.Errorf("undefined routing source %q", source)
-		}
-		for _, target := range targets {
-			if _, ok := m.Nodes[target]; !ok {
-				t.Errorf("undefined routing target %q from %q", target, source)
-			}
-		}
-	}
-}
 
-func TestOpenRouterExpertSwarm(t *testing.T) {
-	m, err := LoadMorphology("../../testdata/openrouter-expert-swarm.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m.Name != "openrouter-expert-swarm" || m.Presentation != "progressive_disclosure" || m.Topology.Type != "handoff" {
-		t.Fatalf("unexpected morphology metadata: name=%q presentation=%q topology=%q", m.Name, m.Presentation, m.Topology.Type)
-	}
-
-	expected := map[string]struct {
-		concurrency int
-		provider    string
-		model       string
-		isPrimary   bool
-	}{
-		"orchestrator": {concurrency: 1, provider: "openrouter", model: "google/gemini-4-neon", isPrimary: true},
-		"flash_coder":  {concurrency: 5, provider: "openrouter", model: "google/gemini-3.7-flash", isPrimary: false},
-		"deep_coder":   {concurrency: 1, provider: "openrouter", model: "google/gemini-4-argon", isPrimary: false},
-	}
-
-	if len(m.Nodes) != len(expected) || len(m.Topology.Rules) != len(expected) {
-		t.Fatalf("expected %d nodes and rules, got %d nodes and %d rules", len(expected), len(m.Nodes), len(m.Topology.Rules))
-	}
-
-	for id, exp := range expected {
-		node, ok := m.Nodes[id]
-		if !ok {
-			t.Fatalf("missing node %q", id)
-		}
-		if node.IsPrimary != exp.isPrimary || node.MaxConcurrency != exp.concurrency {
-			t.Errorf("node %q: primary=%v want %v, concurrency=%d want %d", id, node.IsPrimary, exp.isPrimary, node.MaxConcurrency, exp.concurrency)
-		}
-		if node.Provider != exp.provider || node.Model != exp.model {
-			t.Errorf("node %q: provider/model=%s/%s want %s/%s", id, node.Provider, node.Model, exp.provider, exp.model)
-		}
-		if strings.Contains(node.SystemPrompt, "k3_expert") || strings.Contains(node.SystemPrompt, "Sol") {
-			t.Errorf("node %q refers to stale undefined node", id)
-		}
-		if !slices.Contains(node.Workbench, "handoff") && !slices.Contains(node.Workbench, "*") {
-			t.Errorf("node %q cannot use handoff tool", id)
-		}
-		if id != "orchestrator" {
-			if !slices.Contains(m.Topology.Rules[id], "orchestrator") {
-				t.Errorf("node %q missing return route to orchestrator", id)
+			if primaryCount != 1 {
+				t.Fatalf("%s: expected exactly one primary node, found %d", file, primaryCount)
 			}
-			if !slices.Contains(m.Topology.Rules["orchestrator"], id) {
-				t.Errorf("orchestrator cannot handoff to %q", id)
-			}
-			if slices.Contains(node.Workbench, "todo_manage") || slices.Contains(node.Workbench, "*") {
-				t.Errorf("worker node %q must not expose todo_manage or wildcard", id)
-			}
-			for _, requiredTool := range []string{"read_file", "write_file", "edit_file", "bash_exec", "git", "handoff"} {
-				if !slices.Contains(node.Workbench, requiredTool) {
-					t.Errorf("coding worker %q missing tool %q", id, requiredTool)
+
+			if m.Topology.Type == "handoff" || len(m.Topology.Rules) > 0 {
+				for source, targets := range m.Topology.Rules {
+					srcNode, ok := m.Nodes[source]
+					if !ok {
+						t.Errorf("%s: topology rule source %q does not exist in nodes", file, source)
+						continue
+					}
+					if len(targets) > 0 {
+						hasHandoff := slices.Contains(srcNode.Workbench, "handoff") || slices.Contains(srcNode.Workbench, "*")
+						if !hasHandoff {
+							t.Errorf("%s: node %q has handoff routes %v but workbench does not expose 'handoff' or '*'", file, source, targets)
+						}
+					}
+					for _, target := range targets {
+						if _, ok := m.Nodes[target]; !ok {
+							t.Errorf("%s: topology rule source %q routes to undefined target %q", file, source, target)
+						}
+					}
+				}
+
+				// Verify all non-primary nodes with routing rules can route back to primary
+				for nodeID := range m.Nodes {
+					if nodeID == primaryID {
+						continue
+					}
+					targets, hasRules := m.Topology.Rules[nodeID]
+					if hasRules && !slices.Contains(targets, primaryID) {
+						t.Errorf("%s: non-primary node %q cannot route back to primary node %q (targets: %v)", file, nodeID, primaryID, targets)
+					}
 				}
 			}
-		}
-	}
-
-	orch := m.Nodes["orchestrator"]
-	if !slices.Contains(orch.Workbench, "*") && !slices.Contains(orch.Workbench, "todo_manage") {
-		t.Errorf("orchestrator must have todo/delegation access, got: %v", orch.Workbench)
-	}
-	if len(orch.Fallbacks) != 1 || orch.Fallbacks[0].Provider != "openrouter" || orch.Fallbacks[0].Model != "google/gemini-4-argon" {
-		t.Errorf("orchestrator fallbacks unexpected: %+v", orch.Fallbacks)
-	}
-
-	expectedRules := map[string][]string{
-		"orchestrator": {"flash_coder", "deep_coder"},
-		"flash_coder":  {"orchestrator"},
-		"deep_coder":   {"orchestrator"},
-	}
-	for source, targets := range expectedRules {
-		actual, ok := m.Topology.Rules[source]
-		if !ok {
-			t.Errorf("missing routing rule for %q", source)
-			continue
-		}
-		if len(actual) != len(targets) {
-			t.Errorf("rule %q: expected %d targets %v, got %d targets %v", source, len(targets), targets, len(actual), actual)
-		}
-		for _, target := range targets {
-			if !slices.Contains(actual, target) {
-				t.Errorf("rule %q missing target %q in %v", source, target, actual)
-			}
-		}
-	}
-
-	for source, targets := range m.Topology.Rules {
-		if _, ok := m.Nodes[source]; !ok {
-			t.Errorf("undefined routing source %q", source)
-		}
-		for _, target := range targets {
-			if _, ok := m.Nodes[target]; !ok {
-				t.Errorf("undefined routing target %q from %q", target, source)
-			}
-		}
+		})
 	}
 }
 

@@ -5,6 +5,7 @@ CMD_DIR := ./cmd/codecuttlectl
 INSTALL_PREFIX ?= /usr/local
 INSTALL_BIN_DIR := $(INSTALL_PREFIX)/bin
 INSTALL_PLUGIN_DIR := $(INSTALL_PREFIX)/lib/$(BINARY_NAME)/plugins
+INSTALL_MORPH_DIR := $(INSTALL_PREFIX)/share/$(BINARY_NAME)/morphs
 GO := go
 
 # Build flags
@@ -13,8 +14,9 @@ GOFLAGS := -trimpath
 
 # Plugin sources
 PLUGINS := $(wildcard plugins/cuttlebone-*)
+MORPHS := $(wildcard morphs/*.yaml)
 
-.PHONY: all build build-plugins install install-plugins clean test test-race lint run test-tui-smoke test-runtime-characterization validate
+.PHONY: all build build-plugins install install-plugins install-morphs clean test test-race lint run test-tui-smoke test-runtime-characterization validate
 
 all: build build-plugins
 
@@ -23,8 +25,8 @@ build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 
-## install: Freshly build and atomically install codecuttlectl and all plugins
-install: build install-plugins
+## install: Freshly build and atomically install codecuttlectl, plugins, and morphs
+install: build install-plugins install-morphs
 	@SUDO=""; \
 	if [ -d "$(INSTALL_BIN_DIR)" ]; then \
 		[ -w "$(INSTALL_BIN_DIR)" ] || SUDO="sudo"; \
@@ -53,6 +55,23 @@ install-plugins: build-plugins
 		$$SUDO mv -f "$(INSTALL_PLUGIN_DIR)/.$$name.new" "$(INSTALL_PLUGIN_DIR)/$$name"; \
 	done
 	@ls -lh "$(INSTALL_PLUGIN_DIR)"
+
+## install-morphs: Atomically install starter morph templates
+install-morphs:
+	@SUDO=""; \
+	if [ -d "$(INSTALL_MORPH_DIR)" ]; then \
+		[ -w "$(INSTALL_MORPH_DIR)" ] || SUDO="sudo"; \
+	elif [ -d "$(INSTALL_PREFIX)" ]; then \
+		[ -w "$(INSTALL_PREFIX)" ] || SUDO="sudo"; \
+	fi; \
+	$$SUDO mkdir -p "$(INSTALL_MORPH_DIR)"; \
+	for morph in $(MORPHS); do \
+		name=$$(basename "$$morph"); \
+		$$SUDO cp "$$morph" "$(INSTALL_MORPH_DIR)/.$$name.new" && \
+		$$SUDO chmod 644 "$(INSTALL_MORPH_DIR)/.$$name.new" && \
+		$$SUDO mv -f "$(INSTALL_MORPH_DIR)/.$$name.new" "$(INSTALL_MORPH_DIR)/$$name"; \
+	done
+	@ls -lh "$(INSTALL_MORPH_DIR)"
 
 ## build-plugins: Compile all Cuttlebone plugin binaries
 build-plugins: $(PLUGINS)

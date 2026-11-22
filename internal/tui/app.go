@@ -49,6 +49,7 @@ type Config struct {
 	Store          session.Store
 	SessionID      string            // If set, resume this session
 	Morph          *swarm.Morphology // Pass down morph config
+	MorphName      string            // Morph name for persistence
 	Agent          *conversation.Agent
 	Engine         *conversation.Engine
 	MaxSteps       int              // Max consecutive tool steps per turn (default: 0 = unlimited/agent default)
@@ -72,6 +73,7 @@ type Model struct {
 	enableThinking bool
 	thinkingBudget int
 	morph          *swarm.Morphology
+	morphName      string
 	engine         *conversation.Engine
 	agent          *conversation.Agent
 
@@ -265,6 +267,11 @@ func New(cfg Config) Model {
 		glamour.WithWordWrap(0), // Will be re-created on WindowSizeMsg with actual width
 	)
 
+	morphName := cfg.MorphName
+	if morphName == "" && cfg.Morph != nil {
+		morphName = cfg.Morph.Name
+	}
+
 	m := Model{
 		input:            ta,
 		spinner:          sp,
@@ -295,6 +302,7 @@ func New(cfg Config) Model {
 		rolloverCfg:      rollover.DefaultConfig(),
 		rolloverState:    rollover.StateNormal,
 		morph:            cfg.Morph,
+		morphName:        morphName,
 		agent:            cfg.Agent,
 		engine:           cfg.Engine,
 		swarmEventCh:     make(chan any, 100),
@@ -353,6 +361,7 @@ func New(cfg Config) Model {
 			Model:   modelName,
 			Region:  region,
 			WorkDir: cfg.WorkDir,
+			Morph:   m.morphName,
 		}
 		id, err := cfg.Store.Create(meta)
 		if err == nil {
@@ -2242,6 +2251,10 @@ func (m *Model) saveSession() {
 		meta = existing.Meta
 	} else {
 		meta.ID = m.sessionID
+	}
+
+	if meta.Morph == "" && m.morphName != "" {
+		meta.Morph = m.morphName
 	}
 
 	meta.CurrentEpoch = m.effectiveEpoch()
