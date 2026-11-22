@@ -97,6 +97,7 @@ type Model struct {
 	// Reasoning/thinking state
 	reasoningBuf       *strings.Builder
 	reasoningSignature string
+	reasoningDetails   []provider.ReasoningDetail
 	inReasoning        bool
 	showThinking       bool // Toggle: show/hide thinking (default: true)
 
@@ -457,21 +458,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.streamCh = nil
 					m.interruptPending = false
 					// Finalize any partial content as the response
-					if m.streamBuf.Len() > 0 || m.reasoningSignature != "" || m.reasoningBuf.Len() > 0 {
+					if m.streamBuf.Len() > 0 || m.reasoningSignature != "" || m.reasoningBuf.Len() > 0 || len(m.reasoningDetails) > 0 {
 						var blocks []provider.ContentBlock
 						if m.reasoningBuf.Len() > 0 {
 							blocks = append(blocks, provider.ReasoningBlock{
-								Text:      m.reasoningBuf.String(),
-								Signature: m.reasoningSignature,
+								Text:             m.reasoningBuf.String(),
+								Signature:        m.reasoningSignature,
+								ReasoningDetails: m.reasoningDetails,
 							})
 							m.messages = append(m.messages, chatMessage{
 								role:    "reasoning",
 								content: m.reasoningBuf.String(),
 							})
 							m.reasoningBuf.Reset()
-						} else if m.reasoningSignature != "" {
+						} else if m.reasoningSignature != "" || len(m.reasoningDetails) > 0 {
 							blocks = append(blocks, provider.ReasoningBlock{
-								Signature: m.reasoningSignature,
+								Signature:        m.reasoningSignature,
+								ReasoningDetails: m.reasoningDetails,
 							})
 						}
 
@@ -633,7 +636,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.readNextStreamEvent()
 
 	case StreamReasoningDoneMsg:
-		m.reasoningSignature = msg.Signature
+		if msg.Signature != "" {
+			m.reasoningSignature = msg.Signature
+		}
+		if len(msg.Details) > 0 {
+			m.reasoningDetails = append(m.reasoningDetails, msg.Details...)
+		}
 		// Finalize reasoning block
 		if m.reasoningBuf.Len() > 0 {
 			m.messages = append(m.messages, chatMessage{
@@ -698,6 +706,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.retryUntil = time.Now().Add(msg.Delay)
 		m.retryAttempt, m.retryMax = msg.Attempt, msg.MaxRetries
 		m.retryReason = msg.Reason
+		m.reasoningSignature = ""
+		m.reasoningDetails = nil
 		return m, m.readNextStreamEvent()
 
 	case StreamDoneMsg:
@@ -710,8 +720,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// so that the thought context is preserved across multi-turn function calling.
 			if m.reasoningBuf.Len() > 0 {
 				blocks = append(blocks, provider.ReasoningBlock{
-					Text:      m.reasoningBuf.String(),
-					Signature: m.reasoningSignature,
+					Text:             m.reasoningBuf.String(),
+					Signature:        m.reasoningSignature,
+					ReasoningDetails: m.reasoningDetails,
 				})
 				m.messages = append(m.messages, chatMessage{
 					role:    "reasoning",
@@ -719,11 +730,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m.reasoningBuf.Reset()
 				m.inReasoning = false
-			} else if m.reasoningSignature != "" {
-				// We have a signature but no buffered text (reasoning was already
-				// finalized via StreamReasoningDoneMsg). Still include it.
+			} else if m.reasoningSignature != "" || len(m.reasoningDetails) > 0 {
+				// We have a signature or structured reasoning_details but no buffered text
+				// (reasoning was already finalized via StreamReasoningDoneMsg or encrypted-only).
 				blocks = append(blocks, provider.ReasoningBlock{
-					Signature: m.reasoningSignature,
+					Signature:        m.reasoningSignature,
+					ReasoningDetails: m.reasoningDetails,
 				})
 			}
 			// Include any text that was streamed before/between tool calls
@@ -747,14 +759,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// No tool calls — finalize streamed text as the assistant response
-		if m.streamBuf.Len() > 0 || m.reasoningSignature != "" || m.reasoningBuf.Len() > 0 {
+		if m.streamBuf.Len() > 0 || m.reasoningSignature != "" || m.reasoningBuf.Len() > 0 || len(m.reasoningDetails) > 0 {
 			var blocks []provider.ContentBlock
 
 			// Handle any dangling reasoning text (usually handled by StreamReasoningDoneMsg, but just in case)
 			if m.reasoningBuf.Len() > 0 {
 				blocks = append(blocks, provider.ReasoningBlock{
-					Text:      m.reasoningBuf.String(),
-					Signature: m.reasoningSignature,
+					Text:             m.reasoningBuf.String(),
+					Signature:        m.reasoningSignature,
+					ReasoningDetails: m.reasoningDetails,
 				})
 				m.messages = append(m.messages, chatMessage{
 					role:    "reasoning",
@@ -762,9 +775,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m.reasoningBuf.Reset()
 				m.inReasoning = false
-			} else if m.reasoningSignature != "" {
+			} else if m.reasoningSignature != "" || len(m.reasoningDetails) > 0 {
 				blocks = append(blocks, provider.ReasoningBlock{
-					Signature: m.reasoningSignature,
+					Signature:        m.reasoningSignature,
+					ReasoningDetails: m.reasoningDetails,
 				})
 			}
 
@@ -1115,10 +1129,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			activeID := m.agent.ActiveNode()
 			if activeID != "" {
 				if prov, ok := m.pool.GetNode(activeID); ok && prov != nil {
-					prevProvID := ""
-					if m.llmProvider != nil {
-						prevProvID = m.llmProvider.ID()
-					}
+					prevProvID := provider.EffectiveID(m.llmProvider)
+					targetProvID := provider.EffectiveID(prov)
 
 					if prov != m.llmProvider || m.system != m.agent.SystemPrompt() {
 						m.llmProvider = prov
@@ -1131,8 +1143,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 
 						// Sanitize TUI history for the new target provider (e.g. Bedrock Claude -> Google/OpenRouter)
-						if prevProvID != prov.ID() && len(m.history) > 0 {
-							m.history = provider.SanitizeHistoryForProvider(m.history, prov.ID())
+						if prevProvID != targetProvID && len(m.history) > 0 {
+							m.history = provider.SanitizeHistoryForProvider(m.history, targetProvID)
 						}
 					}
 				}
@@ -1350,6 +1362,7 @@ func (m *Model) launchStream() tea.Cmd {
 	m.streamBuf.Reset()
 	m.reasoningBuf.Reset()
 	m.reasoningSignature = ""
+	m.reasoningDetails = nil
 	m.inReasoning = false
 	m.currentToolInput.Reset()
 	m.pendingToolCalls = nil
@@ -1416,16 +1429,25 @@ func (m *Model) launchStream() tea.Cmd {
 // The full content is always preserved in the Inkwell and session file.
 func (m *Model) maybeCompact() {
 	cfg := compact.DefaultConfig()
+	forceCompact := false
 
 	// For small models, use aggressive compaction settings — these models lose
 	// the thread when large tool results accumulate in context.
 	if m.needsGroundingAssist() {
 		cfg = compact.SmallModelConfig()
+		forceCompact = true
 	} else {
-		// If context usage is high on large models, compact more aggressively
+		// On large models, compact immediately at new user turn boundaries or when
+		// context usage crosses the threshold; mid-turn, batch compactions so prefix
+		// prompt caches stay warm across consecutive tool rounds.
+		if m.streamStep == 0 {
+			forceCompact = true
+		}
 		lastCallTotal := m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 		if compact.ShouldCompact(lastCallTotal, m.contextWindowSize(), cfg) {
 			cfg.PreserveRecentTurns = 3
+			cfg.PreserveRecentToolRounds = 5
+			forceCompact = true
 		}
 	}
 
@@ -1442,8 +1464,7 @@ func (m *Model) maybeCompact() {
 		}
 	}
 
-	// Always compact stale results (older than PreserveRecentTurns)
-	result := compact.CompactProvider(m.history, turn, cfg)
+	result := compact.CompactProviderBatched(m.history, turn, cfg, forceCompact)
 	if result.Compacted > 0 {
 		m.history = result.Messages
 	}
@@ -1483,7 +1504,7 @@ func (m *Model) readNextStreamEvent() tea.Cmd {
 			case provider.ReasoningDeltaEvent:
 				return StreamReasoningMsg{Text: e.Text}
 			case provider.ReasoningSignatureEvent:
-				return StreamReasoningDoneMsg{Signature: e.Signature}
+				return StreamReasoningDoneMsg{Signature: e.Signature, Details: e.Details}
 			case provider.ToolUseStartEvent:
 				return StreamToolStartMsg{ToolUseID: e.ToolUseID, Name: e.Name, ThoughtSignature: e.ThoughtSignature}
 			case provider.ToolInputDeltaEvent:
@@ -1908,13 +1929,10 @@ func (m *Model) restoreSession() {
 		return
 	}
 
-	// Restore conversation history for the model
-	bedrockMessages, err := session.UnmarshalHistory(state.Messages)
-	if err != nil {
-		return
-	}
-	// Convert bedrock types to provider messages
-	m.history = bedrockToProviderMessages(bedrockMessages)
+	// Restore conversation history directly into provider-agnostic messages so
+	// provider metadata (Gemini ThoughtSignature, OpenRouter ReasoningDetails)
+	// survives session resume without lossy Bedrock SDK conversion.
+	m.history = session.UnmarshalProviderHistory(state.Messages)
 
 	// Restore token stats (so resumed sessions accumulate correctly)
 	m.totalInputTokens = state.Meta.Stats.InputTokens
@@ -2668,22 +2686,28 @@ func (m *Model) contextWindowSize() int32 {
 }
 
 // needsGroundingAssist returns true if the current model benefits from periodic
-// grounding reminders. Large frontier models don't need this; smaller/local models do.
+// grounding reminders. Local models (Ollama) and models reporting a genuinely small
+// context window (<= 262k tokens) get grounding assistance. Cloud frontier models
+// (Bedrock, Google, OpenRouter) — including when context window is unknown (0) —
+// do not get small-model grounding injections or auto-nudges.
 func (m *Model) needsGroundingAssist() bool {
-	// If we have a bedrock client (non-nil), it's a frontier model — skip grounding
-	if m.client != nil && m.llmProvider != nil {
-		// Check if it's the bedrockprov wrapper (frontier model)
-		if m.contextWindow > 512_000 {
-			return false
-		}
-	}
-
-	// Check provider's context window
-	if m.contextWindow > 512_000 {
+	// Direct Bedrock clients are cloud models.
+	if m.client != nil && m.llmProvider == nil {
 		return false
 	}
 
-	return true // Small/local model — inject grounding
+	effID := provider.EffectiveID(m.llmProvider)
+	if strings.HasPrefix(effID, "ollama:") {
+		// Local Ollama models always benefit from grounding unless they report a huge window.
+		return m.contextWindow <= 512_000
+	}
+
+	// For non-Ollama providers, only enable grounding when a genuinely small
+	// context window is explicitly reported (never on unknown 0).
+	if m.contextWindow > 0 && m.contextWindow <= 262_144 {
+		return true
+	}
+	return false
 }
 
 // extractLastUserText finds the most recent user text message in history.

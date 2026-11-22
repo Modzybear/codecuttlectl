@@ -31,9 +31,10 @@ type StreamReasoningMsg struct {
 	Text string
 }
 
-// StreamReasoningDoneMsg signals reasoning is complete (signature received).
+// StreamReasoningDoneMsg signals reasoning is complete (signature or structured details received).
 type StreamReasoningDoneMsg struct {
 	Signature string
+	Details   []provider.ReasoningDetail
 }
 
 // StreamToolStartMsg signals that the model is beginning a tool call.
