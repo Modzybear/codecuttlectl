@@ -22,7 +22,10 @@ func CompactProvider(messages []provider.Message, currentTurn int, cfg Config) P
 		return ProviderResult{Messages: messages}
 	}
 
-	preserveFromIdx := findProviderPreserveBoundary(messages, cfg.PreserveRecentTurns)
+	preserveFromIdx := max(
+		findProviderPreserveBoundary(messages, cfg.PreserveRecentTurns),
+		findProviderToolRoundBoundary(messages, cfg.PreserveRecentToolRounds),
+	)
 
 	result := make([]provider.Message, len(messages))
 	totalFreed := 0
@@ -41,26 +44,23 @@ func CompactProvider(messages []provider.Message, currentTurn int, cfg Config) P
 		}
 
 		// Check if this message contains any tool result blocks
-		hasToolResult := false
-		for _, block := range msg.Content {
-			if _, ok := block.(provider.ToolResultBlock); ok {
-				hasToolResult = true
-				break
-			}
-		}
-		if !hasToolResult {
+		if !hasProviderToolResultContent(msg) {
 			result[i] = msg
 			continue
 		}
 
 		// Compact tool results in this message
 		newContent, freed, count := compactProviderToolResults(msg.Content, cfg)
-		result[i] = provider.Message{
-			Role:    msg.Role,
-			Content: newContent,
+		if count > 0 {
+			result[i] = provider.Message{
+				Role:    msg.Role,
+				Content: newContent,
+			}
+			totalFreed += freed
+			compacted += count
+		} else {
+			result[i] = msg
 		}
-		totalFreed += freed
-		compacted += count
 	}
 
 	return ProviderResult{
@@ -106,6 +106,37 @@ func hasProviderTextContent(msg provider.Message) bool {
 	return false
 }
 
+// hasProviderToolResultContent returns true if a message contains at least one tool result block.
+func hasProviderToolResultContent(msg provider.Message) bool {
+	for _, block := range msg.Content {
+		if _, ok := block.(provider.ToolResultBlock); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// findProviderToolRoundBoundary walks backward through provider messages counting
+// user messages that contain ToolResultBlock entries and returns the index at or
+// after which all messages should be preserved.
+// If preserveToolRounds <= 0, the tool-round boundary is disabled and 0 is returned.
+func findProviderToolRoundBoundary(messages []provider.Message, preserveToolRounds int) int {
+	if preserveToolRounds <= 0 {
+		return 0
+	}
+
+	toolRoundsSeen := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == provider.RoleUser && hasProviderToolResultContent(messages[i]) {
+			toolRoundsSeen++
+			if toolRoundsSeen >= preserveToolRounds {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
 // compactProviderToolResults processes content blocks, replacing large tool results
 // with summaries.
 func compactProviderToolResults(content []provider.ContentBlock, cfg Config) ([]provider.ContentBlock, int, int) {
@@ -120,12 +151,12 @@ func compactProviderToolResults(content []provider.ContentBlock, cfg Config) ([]
 			continue
 		}
 
-		if len(tr.Content) < cfg.MinResultSize {
+		if isAlreadyCompacted(tr.Content) || len(tr.Content) < cfg.MinResultSize {
 			newContent = append(newContent, block)
 			continue
 		}
 
-		summary := summarizeToolResult(tr.Content, cfg.SummaryMaxLines)
+		summary := summarizeToolResultWithConfig(tr.Content, cfg)
 		freed := len(tr.Content) - len(summary)
 		if freed <= 0 {
 			newContent = append(newContent, block)
@@ -144,6 +175,21 @@ func compactProviderToolResults(content []provider.ContentBlock, cfg Config) ([]
 	}
 
 	return newContent, totalFreed, count
+}
+
+// CompactProviderBatched applies compaction to provider history, deferring small
+// mid-turn compactions when cfg.MinCompactBatch > 0 and force is false so prefix
+// prompt caches are invalidated in batches rather than on every single tool round.
+// Set force=true at user turn boundaries, when ShouldCompact triggers, or for small models.
+func CompactProviderBatched(messages []provider.Message, currentTurn int, cfg Config, force bool) ProviderResult {
+	result := CompactProvider(messages, currentTurn, cfg)
+	if result.Compacted == 0 {
+		return result
+	}
+	if !force && cfg.MinCompactBatch > 1 && result.Compacted < cfg.MinCompactBatch {
+		return ProviderResult{Messages: messages}
+	}
+	return result
 }
 
 // CompactProviderIfNeeded applies compaction only when the estimated token usage

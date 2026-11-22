@@ -32,6 +32,12 @@ type Config struct {
 	// context intact; with 1M context window we can afford the space).
 	PreserveRecentTurns int
 
+	// PreserveRecentToolRounds is the number of recent tool-result rounds to
+	// preserve untouched regardless of user turn count. This allows compaction
+	// to make progress during long single-turn agent loops with many tool calls.
+	// Values <= 0 disable the tool-round boundary. Default: 12.
+	PreserveRecentToolRounds int
+
 	// SummaryMaxLines is the maximum number of lines to include in a compacted
 	// summary (head + tail combined). Default: 8.
 	SummaryMaxLines int
@@ -39,15 +45,28 @@ type Config struct {
 	// MinResultSize is the minimum character length of a tool result before it's
 	// eligible for compaction. Small results aren't worth compacting. Default: 1000.
 	MinResultSize int
+
+	// MinCompactBatch is the minimum number of newly compactable tool results
+	// required before applying routine mid-turn compaction on large models.
+	// Batching avoids sliding-window invalidation of prompt caches on every
+	// single tool round. Default: 6 (0 disables batching).
+	MinCompactBatch int
 }
+
+const (
+	omissionMarkerHint     = "lines omitted — use read_file"
+	charOmissionMarkerHint = "chars omitted — use read_file"
+)
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxContextPercent:   0.50,
-		PreserveRecentTurns: 7,
-		SummaryMaxLines:     8,
-		MinResultSize:       1000,
+		MaxContextPercent:        0.50,
+		PreserveRecentTurns:      7,
+		PreserveRecentToolRounds: 12,
+		SummaryMaxLines:          8,
+		MinResultSize:            1000,
+		MinCompactBatch:          6,
 	}
 }
 
@@ -68,9 +87,12 @@ func Compact(messages []types.Message, currentTurn int, cfg Config) Result {
 		return Result{Messages: messages}
 	}
 
-	// Identify the boundary: messages belonging to the last N user turns are preserved.
-	// We count user messages backward to find the preserve boundary.
-	preserveFromIdx := findPreserveBoundary(messages, cfg.PreserveRecentTurns)
+	// Identify the boundary: preserve recent user turns or recent tool-result rounds,
+	// advancing to whichever boundary allows compacting older context without losing
+	// the active working window.
+	turnBoundary := findPreserveBoundary(messages, cfg.PreserveRecentTurns)
+	toolRoundBoundary := findToolRoundBoundary(messages, cfg.PreserveRecentToolRounds)
+	preserveFromIdx := max(turnBoundary, toolRoundBoundary)
 
 	result := make([]types.Message, len(messages))
 	totalFreed := 0
@@ -158,6 +180,42 @@ func hasTextContent(msg types.Message) bool {
 	return false
 }
 
+// hasToolResultContent returns true if a message contains at least one tool_result block.
+func hasToolResultContent(msg types.Message) bool {
+	for _, block := range msg.Content {
+		if _, ok := block.(*types.ContentBlockMemberToolResult); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// findToolRoundBoundary walks backward through messages counting user messages
+// that contain tool_result blocks and returns the index at or after which all
+// messages should be preserved.
+// If preserveToolRounds <= 0, the tool-round boundary is disabled and 0 is returned.
+func findToolRoundBoundary(messages []types.Message, preserveToolRounds int) int {
+	if preserveToolRounds <= 0 {
+		return 0
+	}
+
+	toolRoundsSeen := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == types.ConversationRoleUser && hasToolResultContent(messages[i]) {
+			toolRoundsSeen++
+			if toolRoundsSeen >= preserveToolRounds {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// isAlreadyCompacted returns true if text already contains a compaction omission marker.
+func isAlreadyCompacted(text string) bool {
+	return strings.Contains(text, omissionMarkerHint) || strings.Contains(text, charOmissionMarkerHint)
+}
+
 // compactToolResults processes content blocks, replacing large tool_result blocks
 // with summaries. Returns the new content slice, chars freed, and count compacted.
 func compactToolResults(content []types.ContentBlock, cfg Config) ([]types.ContentBlock, int, int) {
@@ -174,14 +232,14 @@ func compactToolResults(content []types.ContentBlock, cfg Config) ([]types.Conte
 
 		// Extract text content from the tool result
 		text := extractToolResultText(tr)
-		if len(text) < cfg.MinResultSize {
-			// Too small to bother compacting
+		if isAlreadyCompacted(text) || len(text) < cfg.MinResultSize {
+			// Already compacted or too small to bother compacting
 			newContent = append(newContent, block)
 			continue
 		}
 
 		// Generate a summary
-		summary := summarizeToolResult(text, cfg.SummaryMaxLines)
+		summary := summarizeToolResultWithConfig(text, cfg)
 		freed := len(text) - len(summary)
 		if freed <= 0 {
 			newContent = append(newContent, block)
@@ -254,4 +312,35 @@ func summarizeToolResult(text string, maxLines int) string {
 	}
 
 	return sb.String()
+}
+
+// summarizeToolResultWithConfig produces a heuristic summary of a tool result
+// using cfg. Multi-line results exceeding SummaryMaxLines are compacted by line
+// count via summarizeToolResult. Huge single-line or few-line results (such as
+// minified JSON) that meet MinResultSize fall back to character-based head/tail
+// truncation.
+func summarizeToolResultWithConfig(text string, cfg Config) string {
+	if isAlreadyCompacted(text) {
+		return text
+	}
+
+	lines := strings.Split(text, "\n")
+	if len(lines) > cfg.SummaryMaxLines {
+		return summarizeToolResult(text, cfg.SummaryMaxLines)
+	}
+
+	if len(text) < cfg.MinResultSize {
+		return text
+	}
+
+	runes := []rune(text)
+	keep := max(cfg.MinResultSize/4, 200)
+	if len(runes) <= keep*2+120 {
+		return text
+	}
+
+	omitted := len(runes) - keep*2
+	head := string(runes[:keep])
+	tail := string(runes[len(runes)-keep:])
+	return fmt.Sprintf("%s\n[... %d chars omitted — use read_file with offset/limit to retrieve specific sections ...]\n%s", head, omitted, tail)
 }
