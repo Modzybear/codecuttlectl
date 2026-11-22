@@ -477,3 +477,62 @@ func TestAutoRolloverArmedHintQuiescentTriggerAndBudget(t *testing.T) {
 		t.Errorf("expected budget pause notice in chat, got %q", lastMsg)
 	}
 }
+
+func TestLastCallContextTokensPersistAcrossReload(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	sid, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	prov := &scriptedRolloverProvider{
+		id:            "openrouter:google/gemini-4-neon",
+		contextWindow: 100_000,
+	}
+
+	m := New(Config{
+		Provider:  prov,
+		Store:     store,
+		SessionID: sid,
+	})
+	m.width = 120
+	m.lastCallInputTokens = 10_000
+	m.lastCallCacheReadInputTokens = 25_000
+	m.lastCallCacheWriteInputTokens = 5_000
+	m.saveSession()
+
+	// Verify persisted value on disk
+	saved, err := store.Load(sid)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if saved.Meta.Stats.LastCallContextTokens != 40_000 {
+		t.Fatalf("saved LastCallContextTokens = %d, want 40000", saved.Meta.Stats.LastCallContextTokens)
+	}
+
+	// Reload into a fresh TUI model with auto-rollover enabled
+	cfg := rollover.DefaultConfig()
+	cfg.AutoRollover = true
+	cfg.SoftPct = 0.30
+	resumed := New(Config{
+		Provider:       prov,
+		Store:          store,
+		SessionID:      sid,
+		RolloverConfig: &cfg,
+	})
+	resumed.width = 120
+
+	if resumed.lastCallInputTokens != 40_000 {
+		t.Fatalf("resumed lastCallInputTokens = %d, want 40000", resumed.lastCallInputTokens)
+	}
+	if bar := resumed.renderStatusBar(); !strings.Contains(bar, "40% ctx") {
+		t.Errorf("expected resumed status bar to show 40%% ctx, got %q", bar)
+	}
+	// Auto-rollover must still wait for a fresh UsageEvent before arming on reload
+	if _, triggered := resumed.maybeAutoRollover(true); triggered {
+		t.Fatal("auto-rollover should not trigger before a fresh API UsageEvent on reloaded session")
+	}
+}

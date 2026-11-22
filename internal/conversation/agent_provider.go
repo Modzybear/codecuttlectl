@@ -645,6 +645,7 @@ func (a *Agent) flushSessionProvider() {
 	meta.CurrentEpoch = a.CurrentEpoch()
 	meta.Stats.Turns = a.turn
 	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
+	meta.Stats.LastCallContextTokens = a.lastCallTokens
 	if a.cumulativeCostUSD > meta.Stats.EstimatedCostUSD {
 		meta.Stats.EstimatedCostUSD = a.cumulativeCostUSD
 	}

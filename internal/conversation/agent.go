@@ -1327,6 +1327,7 @@ func (a *Agent) loadSession() error {
 	a.currentEpoch = state.Meta.EffectiveEpoch()
 	a.originalObjective = state.OriginalObjective
 	a.cumulativeCostUSD = state.Meta.Stats.EstimatedCostUSD
+	a.lastCallTokens = state.Meta.Stats.LastCallContextTokens
 	if len(state.Epochs) > 0 {
 		a.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
 	}

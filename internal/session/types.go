@@ -38,6 +38,7 @@ type Stats struct {
 	OutputTokens          int32   `json:"output_tokens"`
 	CacheReadInputTokens  int32   `json:"cache_read_input_tokens"`
 	CacheWriteInputTokens int32   `json:"cache_write_input_tokens"`
+	LastCallContextTokens int32   `json:"last_call_context_tokens,omitempty"`
 	ToolCalls             int     `json:"tool_calls"`
 	Turns                 int     `json:"turns"`
 	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`

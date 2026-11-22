@@ -94,6 +94,9 @@ func NewDefaultCommandRegistry() *CommandRegistry {
 			m.messages = nil
 			m.todos = todo.NewList()
 			m.originalObjective = ""
+			m.lastCallInputTokens = 0
+			m.lastCallCacheReadInputTokens = 0
+			m.lastCallCacheWriteInputTokens = 0
 			m.rolloverState = rollover.StateNormal
 			m.rolloverPreHistory = nil
 			m.viewport.SetContent("")

@@ -2092,6 +2092,9 @@ func (m *Model) restoreSession() {
 	m.totalOutputTokens = state.Meta.Stats.OutputTokens
 	m.totalCacheReadInputTokens = state.Meta.Stats.CacheReadInputTokens
 	m.totalCacheWriteInputTokens = state.Meta.Stats.CacheWriteInputTokens
+	m.lastCallInputTokens = state.Meta.Stats.LastCallContextTokens
+	m.lastCallCacheReadInputTokens = 0
+	m.lastCallCacheWriteInputTokens = 0
 	m.totalToolCalls = state.Meta.Stats.ToolCalls
 	if m.totalToolCalls == 0 {
 		for _, msg := range m.history {
@@ -2248,6 +2251,7 @@ func (m *Model) saveSession() {
 	meta.Stats.OutputTokens = m.totalOutputTokens
 	meta.Stats.CacheReadInputTokens = m.totalCacheReadInputTokens
 	meta.Stats.CacheWriteInputTokens = m.totalCacheWriteInputTokens
+	meta.Stats.LastCallContextTokens = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 	meta.Stats.ToolCalls = m.totalToolCalls
 	meta.Stats.Turns = m.totalTurns
 	meta.Stats.EstimatedCostUSD = m.estimateCost()
@@ -2334,7 +2338,11 @@ func (m *Model) renderStatusBar() string {
 	}
 	model := StatusModelStyle.Render(modelName)
 	regionStr := StatusDimStyle.Render(region)
-	plugins := StatusDimStyle.Render(fmt.Sprintf("%dp", m.pluginMgr.Count()))
+	pluginCount := 0
+	if m.pluginMgr != nil {
+		pluginCount = m.pluginMgr.Count()
+	}
+	plugins := StatusDimStyle.Render(fmt.Sprintf("%dp", pluginCount))
 
 	// Token display: show total input (including cache), output, cache hit rate, and estimated cost
 	totalIn := m.totalInputTokens + m.totalCacheReadInputTokens + m.totalCacheWriteInputTokens
