@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -259,5 +260,96 @@ func TestNeedsGroundingAssistAndBatchedCompaction(t *testing.T) {
 	tr1 = m.history[2].Content[0].(provider.ToolResultBlock)
 	if len(tr1.Content) >= len(bigContent) {
 		t.Error("expected mid-turn compaction to fire once 6 stale rounds accumulate")
+	}
+}
+
+func TestRestoreSessionSanitizesLegacyUnsignedGeminiToolCalls(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessID, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a legacy pre-PR #75 session with unsigned tool_use + plain-text reasoning (no reasoning_details).
+	legacyMsgs := []provider.Message{
+		provider.BuildUserTextMessage("Audit the repo"),
+		{
+			Role: provider.RoleAssistant,
+			Content: []provider.ContentBlock{
+				provider.ReasoningBlock{Text: "Checking files first"},
+				provider.ToolUseBlock{
+					ToolUseID: "call_legacy_1",
+					Name:      "read_file",
+					Input:     json.RawMessage(`{"path":"README.md"}`),
+				},
+			},
+		},
+		provider.BuildToolResultMessage([]provider.ToolResultBlock{
+			{ToolUseID: "call_legacy_1", Name: "read_file", Content: "readme contents"},
+		}),
+		{
+			Role:    provider.RoleAssistant,
+			Content: []provider.ContentBlock{provider.TextBlock{Text: "Audit complete."}},
+		},
+	}
+	serialized, err := session.MarshalProviderHistory(legacyMsgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(sessID, &session.SessionState{
+		Meta:     session.SessionMeta{ID: sessID, Model: "openrouter:google/gemini-4-neon"},
+		Messages: serialized,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := openrouter.New(openrouter.Config{Model: "google/gemini-4-neon"})
+	restored := New(Config{
+		PluginMgr: pluginhost.NewManager(false),
+		Provider:  prov,
+		Store:     store,
+		SessionID: sessID,
+	})
+
+	if restored.totalToolCalls != 1 {
+		t.Fatalf("expected totalToolCalls=1 preserved for status bar, got %d", restored.totalToolCalls)
+	}
+	var sawToolCallUI, sawToolResultUI bool
+	for _, cm := range restored.messages {
+		if cm.role == "tool_call" {
+			sawToolCallUI = true
+		}
+		if cm.role == "tool_result" {
+			sawToolResultUI = true
+		}
+	}
+	if !sawToolCallUI || !sawToolResultUI {
+		t.Fatalf("expected original UI tool_call/tool_result cards preserved, got %+v", restored.messages)
+	}
+
+	// Wire history must have zero unsigned ToolUseBlock/ToolResultBlock for OpenRouter Gemini.
+	var sawTranscodedCall, sawTranscodedResult bool
+	for _, msg := range restored.history {
+		for _, blk := range msg.Content {
+			switch b := blk.(type) {
+			case provider.ToolUseBlock:
+				t.Fatalf("unexpected unsigned ToolUseBlock left in restored Gemini history: %+v", b)
+			case provider.ToolResultBlock:
+				t.Fatalf("unexpected ToolResultBlock left in restored Gemini history: %+v", b)
+			case provider.TextBlock:
+				if strings.Contains(b.Text, "[Prior tool call: read_file(") {
+					sawTranscodedCall = true
+				}
+				if strings.Contains(b.Text, "[Prior tool result (read_file, ok): readme contents]") {
+					sawTranscodedResult = true
+				}
+			}
+		}
+	}
+	if !sawTranscodedCall || !sawTranscodedResult {
+		t.Fatalf("expected transcoded prior tool call/result text blocks, got history=%+v", restored.history)
 	}
 }

@@ -538,3 +538,77 @@ func TestMaxStepsZeroIsUnlimitedByDefault(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadSessionSanitizesLegacyUnsignedGeminiToolCalls(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessID, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMsgs := []provider.Message{
+		provider.BuildUserTextMessage("Check status"),
+		{
+			Role: provider.RoleAssistant,
+			Content: []provider.ContentBlock{
+				provider.ToolUseBlock{
+					ToolUseID: "call_legacy_agent_1",
+					Name:      "git",
+					Input:     json.RawMessage(`{"subcommand":"status"}`),
+				},
+			},
+		},
+		provider.BuildToolResultMessage([]provider.ToolResultBlock{
+			{ToolUseID: "call_legacy_agent_1", Name: "git", Content: "clean"},
+		}),
+		{
+			Role:    provider.RoleAssistant,
+			Content: []provider.ContentBlock{provider.TextBlock{Text: "Clean repo."}},
+		},
+	}
+	serialized, err := session.MarshalProviderHistory(legacyMsgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(sessID, &session.SessionState{
+		Meta:     session.SessionMeta{ID: sessID, Model: "openrouter:google/gemini-4-neon"},
+		Messages: serialized,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &scriptedConverseProvider{id: "openrouter:google/gemini-4-neon"}
+	a, err := NewAgent(Config{
+		Provider:  prov,
+		Store:     store,
+		SessionID: sessID,
+		WorkDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewAgent load session: %v", err)
+	}
+
+	var sawCall, sawResult bool
+	for _, msg := range a.provHistory {
+		for _, blk := range msg.Content {
+			switch b := blk.(type) {
+			case provider.ToolUseBlock:
+				t.Fatalf("unexpected unsigned ToolUseBlock left in Agent.provHistory: %+v", b)
+			case provider.ToolResultBlock:
+				t.Fatalf("unexpected ToolResultBlock left in Agent.provHistory: %+v", b)
+			case provider.TextBlock:
+				if strings.Contains(b.Text, "[Prior tool call: git(") {
+					sawCall = true
+				}
+				if strings.Contains(b.Text, "[Prior tool result (git, ok): clean]") {
+					sawResult = true
+				}
+			}
+		}
+	}
+	if !sawCall || !sawResult {
+		t.Fatalf("expected transcoded prior tool call/result in Agent.provHistory, got %+v", a.provHistory)
+	}
+}
