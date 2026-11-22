@@ -75,14 +75,17 @@ func (a *Agent) isOrchestratorActive() bool {
 	return node.IsPrimary
 }
 
-func (a *Agent) recordProviderCost(usage provider.Usage) {
+func (a *Agent) recordProviderCost(usage provider.Usage) float64 {
 	if usage.CostUSD > 0 {
 		a.cumulativeCostUSD += usage.CostUSD
-		return
+		return usage.CostUSD
 	}
 	if est, ok := a.provider.(provider.CostEstimator); ok {
-		a.cumulativeCostUSD += est.EstimateCost(usage)
+		c := est.EstimateCost(usage)
+		a.cumulativeCostUSD += c
+		return c
 	}
+	return 0
 }
 
 func (a *Agent) armedSystemHint() string {
@@ -193,7 +196,7 @@ func (a *Agent) rolloverInternal(ctx context.Context, trigger session.RolloverTr
 		if err != nil {
 			return restoreOnErr(fmt.Errorf("rollover closeout failed: %w", err))
 		}
-		a.recordTokenUsage(resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.CacheReadTokens, resp.Usage.CacheWriteTokens, step)
+		a.recordProviderUsage(resp.Usage, step)
 
 		var assistBlocks []provider.ContentBlock
 		if resp.Reasoning != "" || len(resp.ReasoningDetails) > 0 {
@@ -333,6 +336,7 @@ func (a *Agent) rolloverInternal(ctx context.Context, trigger session.RolloverTr
 	a.epochTurns = 0
 	a.msgSeq = 0
 	a.lastCallTokens = 0
+	a.lastCallCacheReadTokens = 0
 	a.armedCtxPct = 0
 	if a.rolloverCtrl != nil {
 		a.rolloverCtrl.OnEpochCommitted()

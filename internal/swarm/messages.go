@@ -42,4 +42,5 @@ type TokenUsageMsg struct {
 	OutputTokens          int32
 	CacheReadInputTokens  int32
 	CacheWriteInputTokens int32
+	CostUSD               float64
 }

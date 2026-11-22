@@ -499,6 +499,8 @@ func TestLastCallContextTokensPersistAcrossReload(t *testing.T) {
 		SessionID: sid,
 	})
 	m.width = 120
+	m.totalInputTokens = 50_000_000 // large historical uncached total should not dilute last-call cache%
+	m.reportedCostUSD = 1.25
 	m.lastCallInputTokens = 10_000
 	m.lastCallCacheReadInputTokens = 25_000
 	m.lastCallCacheWriteInputTokens = 5_000
@@ -509,11 +511,12 @@ func TestLastCallContextTokensPersistAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if saved.Meta.Stats.LastCallContextTokens != 40_000 {
-		t.Fatalf("saved LastCallContextTokens = %d, want 40000", saved.Meta.Stats.LastCallContextTokens)
+	if saved.Meta.Stats.LastCallContextTokens != 40_000 || saved.Meta.Stats.LastCallCacheReadTokens != 25_000 {
+		t.Fatalf("saved last-call stats = (ctx=%d, cacheRead=%d), want (40000, 25000)",
+			saved.Meta.Stats.LastCallContextTokens, saved.Meta.Stats.LastCallCacheReadTokens)
 	}
 
-	// Reload into a fresh TUI model with auto-rollover enabled
+	// Reload into a fresh TUI model with auto-rollover enabled (provider does NOT implement CostEstimator)
 	cfg := rollover.DefaultConfig()
 	cfg.AutoRollover = true
 	cfg.SoftPct = 0.30
@@ -525,11 +528,19 @@ func TestLastCallContextTokensPersistAcrossReload(t *testing.T) {
 	})
 	resumed.width = 120
 
-	if resumed.lastCallInputTokens != 40_000 {
-		t.Fatalf("resumed lastCallInputTokens = %d, want 40000", resumed.lastCallInputTokens)
+	if resumed.lastCallInputTokens != 15_000 || resumed.lastCallCacheReadInputTokens != 25_000 {
+		t.Fatalf("resumed lastCall = (in=%d, cacheRead=%d), want (15000, 25000)",
+			resumed.lastCallInputTokens, resumed.lastCallCacheReadInputTokens)
 	}
-	if bar := resumed.renderStatusBar(); !strings.Contains(bar, "40% ctx") {
+	bar := resumed.renderStatusBar()
+	if !strings.Contains(bar, "40% ctx") {
 		t.Errorf("expected resumed status bar to show 40%% ctx, got %q", bar)
+	}
+	if !strings.Contains(bar, "62% cache") {
+		t.Errorf("expected resumed status bar to show last-call 62%% cache (not diluted by 50M history), got %q", bar)
+	}
+	if !strings.Contains(bar, "~$1.25") {
+		t.Errorf("expected resumed status bar to show ~$1.25 even without CostEstimator, got %q", bar)
 	}
 	// Auto-rollover must still wait for a fresh UsageEvent before arming on reload
 	if _, triggered := resumed.maybeAutoRollover(true); triggered {

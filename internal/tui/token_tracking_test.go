@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -261,6 +263,19 @@ func TestReportedCostAndStatsTracking(t *testing.T) {
 	}
 	if m.estimateCost() != 0.0035 {
 		t.Fatalf("estimateCost() = %v, want 0.0035", m.estimateCost())
+	}
+
+	// Async swarm worker cost accumulates into reportedCostUSD
+	updated, _ = m.Update(swarm.TokenUsageMsg{
+		Assignee:              "flash_coder",
+		InputTokens:           500,
+		OutputTokens:          100,
+		CacheReadInputTokens:  2000,
+		CostUSD:               0.0015,
+	})
+	m = updated.(Model)
+	if math.Abs(m.reportedCostUSD-0.0050) > 1e-9 {
+		t.Fatalf("reportedCostUSD after swarm task = %v, want 0.0050", m.reportedCostUSD)
 	}
 
 	// Tool call counting

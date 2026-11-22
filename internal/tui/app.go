@@ -582,6 +582,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalOutputTokens += msg.OutputTokens
 		m.totalCacheReadInputTokens += msg.CacheReadInputTokens
 		m.totalCacheWriteInputTokens += msg.CacheWriteInputTokens
+		if msg.CostUSD > 0 {
+			m.reportedCostUSD += msg.CostUSD
+		}
 		return m, m.listenSwarmEvents()
 
 	case swarm.TaskCompletedMsg:
@@ -612,7 +615,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingAsyncResults = append(m.pendingAsyncResults, resultText)
 			return m, m.listenSwarmEvents()
 		} else {
-			m.history = append(m.history, provider.BuildUserTextMessage(resultText))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(resultText)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system",
 				content: resultText,
@@ -620,7 +623,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-nudge the idle model so it immediately reviews the background task results
 			nudge := "A background task has completed. Review the injected results above and incorporate them into your response or notify the user."
-			m.history = append(m.history, provider.BuildUserTextMessage(nudge))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(nudge)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system_nudge",
 				content: "↻ auto-continuing to review background task...",
@@ -896,7 +899,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Flush any async results that arrived while we were streaming
 		if len(m.pendingAsyncResults) > 0 {
 			for _, res := range m.pendingAsyncResults {
-				m.history = append(m.history, provider.BuildUserTextMessage(res))
+				m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(res)))
 				m.messages = append(m.messages, chatMessage{
 					role:    "system",
 					content: res,
@@ -906,7 +909,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-nudge the model so it immediately reviews the background task results
 			nudge := "A background task has completed. Review the injected results above and incorporate them into your response."
-			m.history = append(m.history, provider.BuildUserTextMessage(nudge))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(nudge)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system_nudge",
 				content: "↻ auto-continuing to review background task...",
@@ -2092,8 +2095,12 @@ func (m *Model) restoreSession() {
 	m.totalOutputTokens = state.Meta.Stats.OutputTokens
 	m.totalCacheReadInputTokens = state.Meta.Stats.CacheReadInputTokens
 	m.totalCacheWriteInputTokens = state.Meta.Stats.CacheWriteInputTokens
-	m.lastCallInputTokens = state.Meta.Stats.LastCallContextTokens
-	m.lastCallCacheReadInputTokens = 0
+	m.lastCallCacheReadInputTokens = state.Meta.Stats.LastCallCacheReadTokens
+	if state.Meta.Stats.LastCallContextTokens > m.lastCallCacheReadInputTokens {
+		m.lastCallInputTokens = state.Meta.Stats.LastCallContextTokens - m.lastCallCacheReadInputTokens
+	} else {
+		m.lastCallInputTokens = 0
+	}
 	m.lastCallCacheWriteInputTokens = 0
 	m.totalToolCalls = state.Meta.Stats.ToolCalls
 	if m.totalToolCalls == 0 {
@@ -2252,6 +2259,7 @@ func (m *Model) saveSession() {
 	meta.Stats.CacheReadInputTokens = m.totalCacheReadInputTokens
 	meta.Stats.CacheWriteInputTokens = m.totalCacheWriteInputTokens
 	meta.Stats.LastCallContextTokens = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
+	meta.Stats.LastCallCacheReadTokens = m.lastCallCacheReadInputTokens
 	meta.Stats.ToolCalls = m.totalToolCalls
 	meta.Stats.Turns = m.totalTurns
 	meta.Stats.EstimatedCostUSD = m.estimateCost()
@@ -2344,21 +2352,19 @@ func (m *Model) renderStatusBar() string {
 	}
 	plugins := StatusDimStyle.Render(fmt.Sprintf("%dp", pluginCount))
 
-	// Token display: show total input (including cache), output, cache hit rate, and estimated cost
+	// Token display: show total input (including cache), output, most-recent cache hit rate, and estimated cost
 	totalIn := m.totalInputTokens + m.totalCacheReadInputTokens + m.totalCacheWriteInputTokens
-	cacheHitPct := 0
-	if totalIn > 0 {
-		cacheHitPct = int(float64(m.totalCacheReadInputTokens) / float64(totalIn) * 100)
-	}
 	cost := m.estimateCost()
 
-	// Context window usage: based on the most recent API call's total input tokens.
-	// This represents how full the context window is RIGHT NOW (not cumulative).
+	// Context window usage & cache hit rate: based on the most recent API call's total input tokens.
+	// This represents how full the context window is and how well caching hit RIGHT NOW (not cumulative).
 	// Claude Opus 4.x on Bedrock: 200k input context window.
 	ctxUsed := m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 	ctxPct := 0
+	cacheHitPct := 0
 	if ctxUsed > 0 {
 		ctxPct = int(float64(ctxUsed) / float64(m.contextWindowSize()) * 100)
+		cacheHitPct = int(float64(m.lastCallCacheReadInputTokens) / float64(ctxUsed) * 100)
 	}
 
 	// Color the ctx% indicator based on usage level
@@ -2373,10 +2379,11 @@ func (m *Model) renderStatusBar() string {
 		ctxStyled = StatusDimStyle.Render(ctxStr)
 	}
 
-	// Build right-side status: tokens in/out, ctx%, and optionally cost
+	// Build right-side status: tokens in/out, ctx%, and optionally cache% + cost
 	var right string
-	if _, ok := m.llmProvider.(provider.CostEstimator); ok {
-		// Provider with cost API
+	_, hasCostEstimator := m.llmProvider.(provider.CostEstimator)
+	if hasCostEstimator || cost > 0 || m.lastCallCacheReadInputTokens > 0 || m.lastCallCacheWriteInputTokens > 0 || m.totalCacheReadInputTokens > 0 {
+		// Provider with cost/cache metrics (also stays visible during handoff to direct OpenRouter nodes)
 		tokenStr := fmt.Sprintf("%s in %s out %d%% cache ",
 			formatTokenCount(totalIn), formatTokenCount(m.totalOutputTokens), cacheHitPct)
 		tokens := StatusTokenStyle.Render(tokenStr) + ctxStyled + StatusTokenStyle.Render(fmt.Sprintf(" ~$%.2f", cost))

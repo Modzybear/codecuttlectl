@@ -66,8 +66,8 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 				step, resp.StopReason, len(resp.ToolUses), resp.Usage.InputTokens, resp.Usage.OutputTokens)
 		}
 
-		// Accumulate token usage
-		a.recordTokenUsage(resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.CacheReadTokens, resp.Usage.CacheWriteTokens, step)
+		// Accumulate token usage & cost
+		a.recordProviderUsage(resp.Usage, step)
 
 		// Build assistant message for history
 		var assistBlocks []provider.ContentBlock
@@ -92,7 +92,7 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 			a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildAssistantMessage(assistBlocks)))
 		}
 		a.lastCallTokens = resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens
-		a.recordProviderCost(resp.Usage)
+		a.lastCallCacheReadTokens = resp.Usage.CacheReadTokens
 		if a.rolloverCtrl != nil && a.lastCallTokens > 0 {
 			a.rolloverCtrl.MarkUsageSeen()
 		}
@@ -322,17 +322,17 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 					}
 
 				case provider.UsageEvent:
-					a.recordTokenUsage(e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens, step)
-					a.recordProviderCost(provider.Usage{
+					a.recordProviderUsage(provider.Usage{
 						InputTokens:      e.InputTokens,
 						OutputTokens:     e.OutputTokens,
 						CacheReadTokens:  e.CacheReadTokens,
 						CacheWriteTokens: e.CacheWriteTokens,
 						CostUSD:          e.CostUSD,
-					})
+					}, step)
 					if !e.InputTokensUnknown {
 						lastCallTotalTokens = e.InputTokens + e.CacheReadTokens + e.CacheWriteTokens
 						a.lastCallTokens = lastCallTotalTokens
+						a.lastCallCacheReadTokens = e.CacheReadTokens
 						if a.rolloverCtrl != nil && lastCallTotalTokens > 0 {
 							a.rolloverCtrl.MarkUsageSeen()
 						}
@@ -646,6 +646,7 @@ func (a *Agent) flushSessionProvider() {
 	meta.Stats.Turns = a.turn
 	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
 	meta.Stats.LastCallContextTokens = a.lastCallTokens
+	meta.Stats.LastCallCacheReadTokens = a.lastCallCacheReadTokens
 	if a.cumulativeCostUSD > meta.Stats.EstimatedCostUSD {
 		meta.Stats.EstimatedCostUSD = a.cumulativeCostUSD
 	}

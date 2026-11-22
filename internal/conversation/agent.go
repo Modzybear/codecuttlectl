@@ -65,9 +65,10 @@ type Agent struct {
 	currentEpoch      int
 	originalObjective string
 	epochs            []session.EpochCheckpoint
-	msgSeq            int
-	lastCallTokens    int32
-	cumulativeCostUSD float64
+	msgSeq                  int
+	lastCallTokens          int32
+	lastCallCacheReadTokens int32
+	cumulativeCostUSD       float64
 	armedCtxPct       float64
 	rolloverCtrl      *rollover.Controller
 
@@ -1328,6 +1329,7 @@ func (a *Agent) loadSession() error {
 	a.originalObjective = state.OriginalObjective
 	a.cumulativeCostUSD = state.Meta.Stats.EstimatedCostUSD
 	a.lastCallTokens = state.Meta.Stats.LastCallContextTokens
+	a.lastCallCacheReadTokens = state.Meta.Stats.LastCallCacheReadTokens
 	if len(state.Epochs) > 0 {
 		a.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
 	}
@@ -1505,6 +1507,10 @@ func (a *Agent) Workbench() []string {
 
 // recordTokenUsage accumulates token usage and emits a structured log event.
 func (a *Agent) recordTokenUsage(inputTokens, outputTokens, cacheRead, cacheWrite int32, step int) {
+	a.recordTokenUsageWithCost(inputTokens, outputTokens, cacheRead, cacheWrite, 0, step)
+}
+
+func (a *Agent) recordTokenUsageWithCost(inputTokens, outputTokens, cacheRead, cacheWrite int32, costUSD float64, step int) {
 	a.auditTrail.TotalInputTokens += int64(inputTokens)
 	a.auditTrail.TotalOutputTokens += int64(outputTokens)
 	a.auditTrail.TotalCacheReadTokens += int64(cacheRead)
@@ -1528,8 +1534,14 @@ func (a *Agent) recordTokenUsage(inputTokens, outputTokens, cacheRead, cacheWrit
 			OutputTokens:          outputTokens,
 			CacheReadInputTokens:  cacheRead,
 			CacheWriteInputTokens: cacheWrite,
+			CostUSD:               costUSD,
 		})
 	}
+}
+
+func (a *Agent) recordProviderUsage(usage provider.Usage, step int) {
+	costUSD := a.recordProviderCost(usage)
+	a.recordTokenUsageWithCost(usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.CacheWriteTokens, costUSD, step)
 }
 
 // recordToolExec emits a structured tool execution event and updates audit timing.
