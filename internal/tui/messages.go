@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -101,8 +102,9 @@ type TodoUpdatedMsg struct {
 
 // ContinueStreamMsg signals the agent should continue after tool results.
 type ContinueStreamMsg struct {
-	Messages   []provider.ToolResultBlock
-	TodoInputs []json.RawMessage // Raw todo_manage inputs to apply in Update
+	Messages          []provider.ToolResultBlock
+	TodoInputs        []json.RawMessage          // Raw todo_manage inputs to apply in Update
+	CheckpointPayload *session.CheckpointPayload // Set when save_checkpoint was validated during rollover closeout
 }
 
 // ApprovalRequestMsg signals that a tool requires user confirmation before execution.

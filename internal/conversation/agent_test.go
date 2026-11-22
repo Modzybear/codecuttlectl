@@ -8,6 +8,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -166,5 +168,148 @@ func TestAgentProviderCapturesEncryptedReasoningDetails(t *testing.T) {
 	rb2, ok := a2.provHistory[1].Content[0].(provider.ReasoningBlock)
 	if !ok || len(rb2.ReasoningDetails) != 1 || rb2.ReasoningDetails[0].Data != "enc_payload" {
 		t.Fatalf("streamTurnProvider dropped encrypted-only ReasoningDetails: %+v", a2.provHistory[1].Content)
+	}
+}
+
+type scriptedConverseProvider struct {
+	id            string
+	contextWindow int32
+	responses     []*provider.Response
+	errs          []error
+	requests      []provider.Request
+}
+
+func (s *scriptedConverseProvider) ID() string           { return s.id }
+func (s *scriptedConverseProvider) Name() string         { return s.id }
+func (s *scriptedConverseProvider) ContextWindow() int32 { return s.contextWindow }
+func (s *scriptedConverseProvider) Converse(_ context.Context, req provider.Request) (*provider.Response, error) {
+	s.requests = append(s.requests, req)
+	idx := len(s.requests) - 1
+	if idx < len(s.errs) && s.errs[idx] != nil {
+		return nil, s.errs[idx]
+	}
+	if idx < len(s.responses) {
+		return s.responses[idx], nil
+	}
+	return &provider.Response{Content: "done"}, nil
+}
+func (s *scriptedConverseProvider) ConverseStream(_ context.Context, _ provider.Request) <-chan provider.StreamEvent {
+	ch := make(chan provider.StreamEvent)
+	close(ch)
+	return ch
+}
+
+func TestAgentRolloverArchivesInkwellAndSeedsNextEpoch(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	sessID, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	invalidJSON := json.RawMessage(`{"summary":"missing fields"}`)
+	validJSON := json.RawMessage(`{
+		"summary": "Completed Epoch 1 investigation",
+		"lessons_learned": ["Check filestore subdirectory scanning"],
+		"key_files": [{"path": "internal/session/filestore.go", "purpose": "Session storage"}],
+		"resume_instructions": "Start Phase 2 controller"
+	}`)
+
+	prov := &scriptedConverseProvider{
+		id:            "openrouter:google/gemini-4-neon",
+		contextWindow: 1_048_576,
+		responses: []*provider.Response{
+			{
+				ToolUses: []provider.ToolUseRequest{
+					{ToolUseID: "c1", Name: rollover.SaveCheckpointToolName, Input: invalidJSON},
+				},
+			},
+			{
+				ToolUses: []provider.ToolUseRequest{
+					{ToolUseID: "c2", Name: rollover.SaveCheckpointToolName, Input: validJSON},
+				},
+			},
+		},
+	}
+
+	a := &Agent{
+		provider:          prov,
+		store:             store,
+		sessionID:         sessID,
+		workDir:           t.TempDir(),
+		maxSteps:          5,
+		todos:             todo.NewList(),
+		currentEpoch:      1,
+		turn:              3,
+		originalObjective: "Build Epoch Rollover",
+		provHistory: []provider.Message{
+			provider.BuildUserTextMessage("Build Epoch Rollover"),
+			provider.BuildAssistantMessage([]provider.ContentBlock{provider.TextBlock{Text: "Initial work done"}}),
+		},
+		inkwell: []session.InkEntry{
+			{ToolName: "read_file", Output: "full file contents"},
+			{ToolName: "grep", Output: "matches"},
+		},
+	}
+
+	cp, err := a.Rollover(context.Background(), rollover.DocsPolicyNone, "focus on tests")
+	if err != nil {
+		t.Fatalf("Agent.Rollover: %v", err)
+	}
+	if cp.Epoch != 1 || a.CurrentEpoch() != 2 {
+		t.Fatalf("expected Epoch 1 -> 2, got cp.Epoch=%d current=%d", cp.Epoch, a.CurrentEpoch())
+	}
+	if len(a.inkwell) != 0 {
+		t.Fatalf("expected active inkwell cleared after archival, got %d entries", len(a.inkwell))
+	}
+	if a.archivedToolCalls != 2 {
+		t.Fatalf("archivedToolCalls = %d, want 2", a.archivedToolCalls)
+	}
+
+	// Verify Epoch 1 archive preserved both messages and Inkwell entries
+	arch, err := store.LoadEpochArchive(sessID, 1)
+	if err != nil {
+		t.Fatalf("LoadEpochArchive(1): %v", err)
+	}
+	if len(arch.Messages) != 2 || len(arch.Inkwell) != 2 {
+		t.Fatalf("archive mismatch: msgs=%d inkwell=%d", len(arch.Messages), len(arch.Inkwell))
+	}
+
+	// Verify active session file on disk has Epoch 2, cumulative ToolCalls==2, empty Inkwell, and bootstrap seed
+	saved, err := store.Load(sessID)
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	if saved.Meta.CurrentEpoch != 2 || saved.Meta.Stats.ToolCalls != 2 || len(saved.Inkwell) != 0 || len(saved.Epochs) != 1 {
+		t.Fatalf("saved active session mismatch: epoch=%d toolCalls=%d ink=%d epochs=%d",
+			saved.Meta.CurrentEpoch, saved.Meta.Stats.ToolCalls, len(saved.Inkwell), len(saved.Epochs))
+	}
+	if len(a.provHistory) != 1 || !strings.Contains(a.provHistory[0].Content[0].(provider.TextBlock).Text, "Completed Epoch 1 investigation") {
+		t.Fatalf("unexpected Epoch 2 bootstrap history: %+v", a.provHistory)
+	}
+}
+
+func TestAgentRolloverFailureRestoresHistory(t *testing.T) {
+	prov := &scriptedConverseProvider{
+		id:            "openrouter:google/gemini-4-neon",
+		contextWindow: 1_048_576,
+		errs:          []error{context.Canceled},
+	}
+	a := &Agent{
+		provider:     prov,
+		maxSteps:     5,
+		todos:        todo.NewList(),
+		currentEpoch: 1,
+		provHistory: []provider.Message{
+			provider.BuildUserTextMessage("keep me"),
+		},
+	}
+	if _, err := a.Rollover(context.Background(), rollover.DocsPolicyNone, ""); err == nil {
+		t.Fatal("expected error when closeout provider call fails")
+	}
+	if a.CurrentEpoch() != 1 || len(a.provHistory) != 1 {
+		t.Fatalf("expected original history preserved on rollback: epoch=%d len=%d", a.CurrentEpoch(), len(a.provHistory))
 	}
 }

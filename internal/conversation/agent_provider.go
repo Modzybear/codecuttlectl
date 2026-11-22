@@ -23,10 +23,10 @@ import (
 // turnProvider implements Turn using the provider interface.
 func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, error) {
 	a.turn++
-	a.provHistory = append(a.provHistory, provider.Message{
-		Role:    provider.RoleUser,
-		Content: []provider.ContentBlock{provider.TextBlock{Text: userMessage}},
-	})
+	if a.originalObjective == "" {
+		a.originalObjective = strings.TrimSpace(userMessage)
+	}
+	a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildUserTextMessage(userMessage)))
 
 	// Initialize state dictionary for this turn — tracks ground-truth about execution.
 	sd := newStateDict(userMessage)
@@ -81,11 +81,9 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 			})
 		}
 		if len(assistBlocks) > 0 {
-			a.provHistory = append(a.provHistory, provider.Message{
-				Role:    provider.RoleAssistant,
-				Content: assistBlocks,
-			})
+			a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildAssistantMessage(assistBlocks)))
 		}
+		a.lastCallTokens = resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens
 
 		// If no tool calls, we're done
 		if len(resp.ToolUses) == 0 {
@@ -157,10 +155,10 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		}
 
 		// Add tool results as a user message
-		a.provHistory = append(a.provHistory, provider.Message{
+		a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.Message{
 			Role:    provider.RoleUser,
 			Content: resultBlocks,
-		})
+		}))
 		a.dirty = true
 
 		// Compact old tool results to bound context growth across long tool chains.
@@ -184,10 +182,10 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 // streamTurnProvider implements StreamTurn using the provider interface.
 func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb StreamCallback) (string, error) {
 	a.turn++
-	a.provHistory = append(a.provHistory, provider.Message{
-		Role:    provider.RoleUser,
-		Content: []provider.ContentBlock{provider.TextBlock{Text: userMessage}},
-	})
+	if a.originalObjective == "" {
+		a.originalObjective = strings.TrimSpace(userMessage)
+	}
+	a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildUserTextMessage(userMessage)))
 
 	// State dictionary for grounding (only used for small models)
 	sd := newStateDict(userMessage)
@@ -294,6 +292,7 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 					a.recordTokenUsage(e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens, step)
 					if !e.InputTokensUnknown {
 						lastCallTotalTokens = e.InputTokens + e.CacheReadTokens + e.CacheWriteTokens
+						a.lastCallTokens = lastCallTotalTokens
 					}
 
 				case provider.StreamErrorEvent:
@@ -362,10 +361,7 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 			})
 		}
 		if len(assistBlocks) > 0 {
-			a.provHistory = append(a.provHistory, provider.Message{
-				Role:    provider.RoleAssistant,
-				Content: assistBlocks,
-			})
+			a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildAssistantMessage(assistBlocks)))
 		}
 
 		// If no tool calls, we're done
@@ -428,10 +424,10 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 			}
 		}
 
-		a.provHistory = append(a.provHistory, provider.Message{
+		a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.Message{
 			Role:    provider.RoleUser,
 			Content: resultBlocks,
-		})
+		}))
 		a.dirty = true
 
 		// Compact old tool results to bound context growth across long tool chains.
@@ -589,16 +585,30 @@ func (a *Agent) flushSessionProvider() {
 		meta.ID = a.sessionID
 	}
 
-	// Update stats
+	// Update stats & epoch metadata
+	meta.CurrentEpoch = a.CurrentEpoch()
 	meta.Stats.Turns = a.turn
-	meta.Stats.ToolCalls = len(a.inkwell)
+	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
+
+	origObj := a.originalObjective
+	epochs := a.epochs
+	if loadErr == nil && existing != nil {
+		if origObj == "" {
+			origObj = existing.OriginalObjective
+		}
+		if len(epochs) == 0 && len(existing.Epochs) > 0 {
+			epochs = existing.Epochs
+		}
+	}
 
 	state := &session.SessionState{
-		Meta:     meta,
-		Messages: messages,
-		Todos:    a.todos.Items(),
-		Inkwell:  a.inkwell,
-		Audit:    a.AuditTrail(),
+		Meta:              meta,
+		OriginalObjective: origObj,
+		Messages:          messages,
+		Epochs:            epochs,
+		Todos:             a.todos.Items(),
+		Inkwell:           a.inkwell,
+		Audit:             a.AuditTrail(),
 	}
 
 	if err := a.store.Save(a.sessionID, state); err != nil {

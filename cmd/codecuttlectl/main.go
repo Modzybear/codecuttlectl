@@ -25,6 +25,7 @@ import (
 	googleprov "github.com/Modzybear/codecuttlectl/internal/provider/google"
 	"github.com/Modzybear/codecuttlectl/internal/provider/ollama"
 	"github.com/Modzybear/codecuttlectl/internal/provider/openrouter"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/swarm"
 	"github.com/Modzybear/codecuttlectl/internal/tui"
@@ -572,6 +573,40 @@ func runPlainREPL(ctx context.Context, agent *conversation.Agent, store session.
 		}
 		if input == "exit" || input == "quit" {
 			break
+		}
+
+		if strings.HasPrefix(input, "/") {
+			fields := strings.Fields(input)
+			switch strings.ToLower(fields[0]) {
+			case "/help":
+				fmt.Println("Available commands:")
+				fmt.Println("  /rollover [--docs|--no-docs] [hint...]   Checkpoint current epoch and start a fresh context window")
+				fmt.Println("  /epochs                                  List completed epoch checkpoints")
+				fmt.Println("  /help                                    Show this help")
+				fmt.Println("  exit | quit                              Exit session")
+				continue
+			case "/epochs":
+				fmt.Println(rollover.FormatEpochsTable(agent.CurrentEpoch(), agent.Epochs()))
+				continue
+			case "/rollover":
+				docsOverride, hint, err := tui.ParseRolloverCommandArgs(fields[1:])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\nUsage: /rollover [--docs|--no-docs] [hint...]\n", err)
+					continue
+				}
+				policy := rollover.DocsPolicyNone
+				if docsOverride != nil {
+					policy = *docsOverride
+				}
+				fmt.Fprintf(os.Stderr, "↻ Rolling over Epoch %d → Epoch %d...\n", agent.CurrentEpoch(), agent.CurrentEpoch()+1)
+				cp, err := agent.Rollover(ctx, policy, hint)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Rollover failed: %v\n", err)
+					continue
+				}
+				fmt.Printf("✓ Epoch %d archived (%s). Now in Epoch %d (%d priority files).\n", cp.Epoch, cp.ArchiveFile, agent.CurrentEpoch(), len(cp.Payload.KeyFiles))
+				continue
+			}
 		}
 
 		response, err := agent.StreamTurn(ctx, input, func(ev conversation.StreamEvent) {

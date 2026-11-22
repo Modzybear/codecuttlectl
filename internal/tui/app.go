@@ -26,6 +26,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/prompt"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
 	bedrockprov "github.com/Modzybear/codecuttlectl/internal/provider/bedrock"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/swarm"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
@@ -45,11 +46,12 @@ type Config struct {
 	AutoApprove    bool // When true, skip destructive operation confirmations
 
 	// Session persistence
-	Store     session.Store
-	SessionID string            // If set, resume this session
-	Morph     *swarm.Morphology // Pass down morph config
-	Agent     *conversation.Agent
-	Engine    *conversation.Engine
+	Store          session.Store
+	SessionID      string            // If set, resume this session
+	Morph          *swarm.Morphology // Pass down morph config
+	Agent          *conversation.Agent
+	Engine         *conversation.Engine
+	RolloverConfig *rollover.Config // Optional epoch rollover config (nil = DefaultConfig)
 }
 
 // Model is the main Bubble Tea application model.
@@ -123,10 +125,27 @@ type Model struct {
 	todoExpanded bool
 
 	// Session persistence
-	store            session.Store
-	sessionID        string
-	lastSavedDraft   string
-	draftDebounceSeq uint64
+	store             session.Store
+	sessionID         string
+	lastSavedDraft    string
+	draftDebounceSeq  uint64
+	currentEpoch      int
+	originalObjective string
+	epochs            []session.EpochCheckpoint
+	msgSeq            int
+
+	// Slash command registry & epoch rollover state
+	cmdReg                   *CommandRegistry
+	rolloverCfg              rollover.Config
+	rolloverState            rollover.State
+	rolloverPreHistory       []provider.Message
+	rolloverDocsPolicy       rollover.DocsPolicy
+	rolloverDocsAllowed      bool
+	rolloverTrigger          session.RolloverTrigger
+	rolloverSteeringHint     string
+	rolloverCloseoutStep     int
+	rolloverCloseoutMaxSteps int
+	rolloverTokensBefore     int32
 
 	// Stats
 	totalInputTokens           int32
@@ -257,12 +276,20 @@ func New(cfg Config) Model {
 		mdRenderer:       renderer,
 		store:            cfg.Store,
 		sessionID:        cfg.SessionID,
+		currentEpoch:     1,
+		cmdReg:           NewDefaultCommandRegistry(),
+		rolloverCfg:      rollover.DefaultConfig(),
+		rolloverState:    rollover.StateNormal,
 		morph:            cfg.Morph,
 		agent:            cfg.Agent,
 		engine:           cfg.Engine,
 		swarmEventCh:     make(chan any, 100),
 		dispatchedTasks:  make(map[string]bool),
 		swarmProgress:    make(map[string]string),
+	}
+
+	if cfg.RolloverConfig != nil {
+		m.rolloverCfg = *cfg.RolloverConfig
 	}
 
 	if m.morph != nil {
@@ -457,6 +484,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.streaming = false
 					m.streamCh = nil
 					m.interruptPending = false
+
+					// If interrupted during rollover closeout, abort cleanly and keep current epoch intact.
+					if m.rolloverState == rollover.StateCloseout {
+						m.abortRollover(fmt.Sprintf("Rollover cancelled (Esc) — staying in Epoch %d with history intact.", m.effectiveEpoch()))
+						return m, nil
+					}
 					// Finalize any partial content as the response
 					if m.streamBuf.Len() > 0 || m.reasoningSignature != "" || m.reasoningBuf.Len() > 0 || len(m.reasoningDetails) > 0 {
 						var blocks []provider.ContentBlock
@@ -489,7 +522,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 
 						if len(blocks) > 0 {
-							m.history = append(m.history, provider.BuildAssistantMessage(blocks))
+							m.history = append(m.history, m.stampMessage(provider.BuildAssistantMessage(blocks)))
 						}
 					}
 					m.inReasoning = false
@@ -753,7 +786,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ThoughtSignature: tc.thoughtSignature,
 				})
 			}
-			m.history = append(m.history, provider.BuildAssistantMessage(blocks))
+			m.history = append(m.history, m.stampMessage(provider.BuildAssistantMessage(blocks)))
 			m.lastExecutedTools = m.pendingToolCalls // Save for state dict tracking
 			return m, m.executePendingTools()
 		}
@@ -820,7 +853,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if len(blocks) > 0 {
-				m.history = append(m.history, provider.BuildAssistantMessage(blocks))
+				m.history = append(m.history, m.stampMessage(provider.BuildAssistantMessage(blocks)))
 			}
 		} else if !m.streamEmitted && len(m.pendingToolCalls) == 0 {
 			// Upstream model finished without text, reasoning, or tool calls.
@@ -830,6 +863,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content: "*(model returned an empty response — please retry)*",
 				isError: true,
 			})
+		}
+
+		// If the model finished without calling save_checkpoint during closeout,
+		// nudge it within the closeout step budget or abort cleanly.
+		if m.rolloverState == rollover.StateCloseout {
+			if m.rolloverCloseoutStep < m.rolloverCloseoutMaxSteps {
+				m.rolloverCloseoutStep++
+				reminder := "Please call the `save_checkpoint` tool now with summary, lessons_learned, key_files, and resume_instructions to finalize this epoch rollover."
+				m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(reminder)))
+				m.updateViewportContent()
+				return m, m.launchStream()
+			}
+			m.streaming = false
+			m.streamCh = nil
+			m.abortRollover(fmt.Sprintf("Rollover aborted: model did not call save_checkpoint within %d steps — staying in Epoch %d.", m.rolloverCloseoutMaxSteps, m.effectiveEpoch()))
+			return m, nil
 		}
 
 		m.streaming = false
@@ -881,6 +930,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stopModelStream()
 		m.streaming = false
 		m.streamCh = nil
+		if m.rolloverState == rollover.StateCloseout {
+			m.abortRollover(fmt.Sprintf("Rollover failed during closeout (%v) — staying in Epoch %d with history intact.", msg.Err, m.effectiveEpoch()))
+			return m, nil
+		}
 		m.messages = append(m.messages, chatMessage{
 			role:    "assistant",
 			content: fmt.Sprintf("Error: %v", msg.Err),
@@ -1120,8 +1173,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.updateViewportContent()
 
+		// If save_checkpoint succeeded during closeout, commit the epoch rollover now!
+		if m.rolloverState == rollover.StateCloseout && msg.CheckpointPayload != nil {
+			cmd := m.commitEpochRollover(*msg.CheckpointPayload)
+			return m, cmd
+		}
+
 		// Add tool results to history
-		m.history = append(m.history, provider.BuildToolResultMessage(msg.Messages))
+		m.history = append(m.history, m.stampMessage(provider.BuildToolResultMessage(msg.Messages)))
 
 		// If a handoff just executed successfully in the agent, sync the TUI model state
 		// (provider, system prompt, context window) to match the new active node and sanitize history!
@@ -1152,6 +1211,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.saveSession()
+		if m.rolloverState == rollover.StateCloseout {
+			m.rolloverCloseoutStep++
+			if m.rolloverCloseoutStep > m.rolloverCloseoutMaxSteps {
+				m.streaming = false
+				m.streamCh = nil
+				m.abortRollover(fmt.Sprintf("Rollover aborted: closeout exceeded %d steps without a valid save_checkpoint — staying in Epoch %d.", m.rolloverCloseoutMaxSteps, m.effectiveEpoch()))
+				return m, nil
+			}
+		}
 		m.streamStep++ // Track consecutive tool-use rounds for grounding
 
 		// Update state dictionary with tool execution results
@@ -1592,26 +1660,18 @@ func (m *Model) recalcLayout() {
 // --- Actions ---
 
 func (m *Model) submitMessage(text string) tea.Cmd {
-	if text == "/reset" {
-		m.history = nil
-		m.messages = nil
-		m.todos = todo.NewList()
-		m.viewport.SetContent("")
-		return nil
+	if m.cmdReg != nil {
+		if handled, cmd := m.cmdReg.Dispatch(m, text); handled {
+			return cmd
+		}
 	}
-	if text == "/plugins" {
-		names := m.pluginMgr.PluginNames()
-		m.messages = append(m.messages, chatMessage{
-			role:    "assistant",
-			content: "Loaded plugins: " + strings.Join(names, ", "),
-		})
-		m.viewport.SetContent(m.renderMessages())
-		m.viewport.GotoBottom()
-		return nil
+
+	if m.originalObjective == "" {
+		m.originalObjective = rollover.ResolveOriginalObjective("", []provider.Message{provider.BuildUserTextMessage(text)})
 	}
 
 	m.messages = append(m.messages, chatMessage{role: "user", content: text})
-	m.history = append(m.history, provider.BuildUserTextMessage(text))
+	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(text)))
 	m.viewport.SetContent(m.renderMessages())
 	m.viewport.GotoBottom()
 
@@ -1637,13 +1697,50 @@ func (m *Model) executePendingTools() tea.Cmd {
 	pluginMgr := m.pluginMgr
 	workDir := m.workDir
 	autoApprove := m.autoApprove
+	inCloseout := m.rolloverState == rollover.StateCloseout
+	allowDocWrites := m.rolloverDocsAllowed
 
 	return func() tea.Msg {
 		var results []provider.ToolResultBlock
 		var todoInputs []json.RawMessage
+		var checkpointPayload *session.CheckpointPayload
 		ctx := context.Background()
 
 		for i, tool := range tools {
+			// During rollover closeout, intercept save_checkpoint and restrict tools.
+			if inCloseout {
+				if tool.name == rollover.SaveCheckpointToolName {
+					payload, err := rollover.ParseAndValidateCheckpoint(tool.input)
+					if err != nil {
+						results = append(results, provider.ToolResultBlock{
+							ToolUseID: tool.id,
+							Name:      tool.name,
+							Content:   fmt.Sprintf("Error: %s\nPlease fix the missing/invalid fields and call save_checkpoint again.", err.Error()),
+							IsError:   true,
+						})
+						continue
+					}
+					cp := payload
+					checkpointPayload = &cp
+					results = append(results, provider.ToolResultBlock{
+						ToolUseID: tool.id,
+						Name:      tool.name,
+						Content:   "Checkpoint validated and accepted. Closing epoch.",
+						IsError:   false,
+					})
+					continue
+				}
+				if !rollover.IsCloseoutToolAllowed(tool.name, allowDocWrites) {
+					results = append(results, provider.ToolResultBlock{
+						ToolUseID: tool.id,
+						Name:      tool.name,
+						Content:   fmt.Sprintf("Error: Tool %q is not permitted during rollover closeout. Finish inspecting and call save_checkpoint.", tool.name),
+						IsError:   true,
+					})
+					continue
+				}
+			}
+
 			// Security Gate: Check workbench authorization before executing or queuing
 			var activeWorkbench []string
 			if m.agent != nil {
@@ -1732,7 +1829,11 @@ func (m *Model) executePendingTools() tea.Cmd {
 			})
 		}
 
-		return ContinueStreamMsg{Messages: results, TodoInputs: todoInputs}
+		return ContinueStreamMsg{
+			Messages:          results,
+			TodoInputs:        todoInputs,
+			CheckpointPayload: checkpointPayload,
+		}
 	}
 }
 
@@ -1933,6 +2034,12 @@ func (m *Model) restoreSession() {
 	// provider metadata (Gemini ThoughtSignature, OpenRouter ReasoningDetails)
 	// survives session resume without lossy Bedrock SDK conversion.
 	m.history = session.UnmarshalProviderHistory(state.Messages)
+	m.currentEpoch = state.Meta.EffectiveEpoch()
+	m.originalObjective = rollover.ResolveOriginalObjective(state.OriginalObjective, m.history)
+	if len(state.Epochs) > 0 {
+		m.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
+	}
+	m.msgSeq = len(m.history)
 
 	// Restore token stats (so resumed sessions accumulate correctly)
 	m.totalInputTokens = state.Meta.Stats.InputTokens
@@ -2073,18 +2180,40 @@ func (m *Model) saveSession() {
 		meta.ID = m.sessionID
 	}
 
+	meta.CurrentEpoch = m.effectiveEpoch()
 	meta.Stats.InputTokens = m.totalInputTokens
 	meta.Stats.OutputTokens = m.totalOutputTokens
 	meta.Stats.CacheReadInputTokens = m.totalCacheReadInputTokens
 	meta.Stats.CacheWriteInputTokens = m.totalCacheWriteInputTokens
 	meta.Stats.EstimatedCostUSD = m.estimateCost()
 
+	var existingInkwell []session.InkEntry
+	var existingAudit session.AuditTrail
+	origObj := m.originalObjective
+	epochs := m.epochs
+	if loadErr == nil && existing != nil {
+		existingInkwell = existing.Inkwell
+		existingAudit = existing.Audit
+		if origObj == "" {
+			origObj = existing.OriginalObjective
+		}
+		if len(epochs) == 0 && len(existing.Epochs) > 0 {
+			epochs = existing.Epochs
+		}
+	}
+	if existingInkwell == nil {
+		existingInkwell = []session.InkEntry{}
+	}
+
 	state := &session.SessionState{
-		Meta:         meta,
-		Messages:     serialized,
-		Todos:        m.todos.Items(),
-		Inkwell:      []session.InkEntry{}, // TUI inkwell tracking can be added later
-		DraftMessage: m.input.Value(),
+		Meta:              meta,
+		OriginalObjective: origObj,
+		Messages:          serialized,
+		Epochs:            epochs,
+		Todos:             m.todos.Items(),
+		Inkwell:           existingInkwell,
+		Audit:             existingAudit,
+		DraftMessage:      m.input.Value(),
 	}
 
 	m.store.Save(m.sessionID, state)
@@ -2187,14 +2316,28 @@ func (m *Model) renderStatusBar() string {
 		right = tokens + " "
 	}
 
-	left := " " + label + "  " + model + "  " + regionStr + "  " + plugins
+	epochSuffix := ""
+	if m.effectiveEpoch() > 1 || m.rolloverState != rollover.StateNormal {
+		epochBadge := fmt.Sprintf("E%d", m.effectiveEpoch())
+		switch m.rolloverState {
+		case rollover.StateArmed:
+			epochBadge += " (armed)"
+		case rollover.StateCloseout:
+			epochBadge += " (rollover)"
+		case rollover.StateBootstrapping:
+			epochBadge += " (orienting)"
+		}
+		epochSuffix = "  " + StatusDimStyle.Render(epochBadge)
+	}
+
+	left := " " + label + "  " + model + "  " + regionStr + "  " + plugins + epochSuffix
 
 	leftW := lipgloss.Width(left)
 	rightW := lipgloss.Width(right)
 	gap := m.width - leftW - rightW
 	if gap < 1 {
-		// Terminal too narrow — drop some info
-		left = " " + label + "  " + model
+		// Terminal too narrow — drop some info, keep epoch badge
+		left = " " + label + "  " + model + epochSuffix
 		leftW = lipgloss.Width(left)
 		gap = m.width - leftW - rightW
 		if gap < 1 {
@@ -2640,6 +2783,19 @@ func (m *Model) providerToolDefs() []provider.ToolDefinition {
 		})
 	}
 
+	// During rollover closeout, restrict available tools to safe inspection
+	// (plus optional doc edits) and expose save_checkpoint exclusively.
+	if m.rolloverState == rollover.StateCloseout {
+		var filtered []provider.ToolDefinition
+		for _, td := range result {
+			if rollover.IsCloseoutToolAllowed(td.Name, m.rolloverDocsAllowed) {
+				filtered = append(filtered, td)
+			}
+		}
+		filtered = append(filtered, rollover.SaveCheckpointToolDef())
+		return filtered
+	}
+
 	return result
 }
 
@@ -2811,4 +2967,326 @@ func (m *Model) shouldAutoNudge(content string) bool {
 	}
 
 	return false
+}
+
+// --- Epoch Rollover Helpers ---
+
+func (m *Model) effectiveEpoch() int {
+	if m.currentEpoch <= 0 {
+		return 1
+	}
+	return m.currentEpoch
+}
+
+func (m *Model) activeNodeID() string {
+	if m.agent != nil && m.agent.ActiveNode() != "" {
+		return m.agent.ActiveNode()
+	}
+	if m.morph != nil {
+		for name, node := range m.morph.Nodes {
+			if node.IsPrimary {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func (m *Model) turnCount() int {
+	turns := 0
+	for _, msg := range m.history {
+		if msg.Role == provider.RoleUser {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					turns++
+					break
+				}
+			}
+		}
+	}
+	return turns
+}
+
+func (m *Model) stampMessage(msg provider.Message) provider.Message {
+	m.msgSeq++
+	if msg.ID == "" {
+		msg.ID = fmt.Sprintf("e%d_msg_%04d", m.effectiveEpoch(), m.msgSeq)
+	}
+	if msg.Epoch == 0 {
+		msg.Epoch = m.effectiveEpoch()
+	}
+	if msg.Turn == 0 {
+		msg.Turn = m.turnCount()
+		if msg.Role == provider.RoleUser {
+			msg.Turn++
+		}
+	}
+	if msg.Timestamp.IsZero() {
+		msg.Timestamp = time.Now().UTC()
+	}
+	if msg.NodeID == "" {
+		msg.NodeID = m.activeNodeID()
+	}
+	if msg.Model == "" {
+		msg.Model = provider.EffectiveID(m.llmProvider)
+	}
+	return msg
+}
+
+func (m *Model) appendSystemNotice(content string, isError bool) {
+	m.messages = append(m.messages, chatMessage{
+		role:    "assistant",
+		content: content,
+		isError: isError,
+	})
+	m.updateViewportContent()
+}
+
+func (m *Model) formatAutoRolloverStatus() string {
+	status := "off"
+	if m.rolloverCfg.AutoRollover {
+		status = "on"
+	}
+	maxEpochsStr := "unlimited"
+	if m.rolloverCfg.MaxEpochs > 0 {
+		maxEpochsStr = fmt.Sprintf("%d", m.rolloverCfg.MaxEpochs)
+	}
+	maxCostStr := "unlimited"
+	if m.rolloverCfg.MaxCostUSD > 0 {
+		maxCostStr = fmt.Sprintf("$%.2f", m.rolloverCfg.MaxCostUSD)
+	}
+	return fmt.Sprintf(
+		"Auto-rollover: %s (Epoch %d, state: %s)\n  soft=%.0f%%  hard=%.0f%%  docs=%s  max-epochs=%s  max-cost=%s",
+		status,
+		m.effectiveEpoch(),
+		m.rolloverState,
+		m.rolloverCfg.SoftPct*100,
+		m.rolloverCfg.HardPct*100,
+		m.rolloverCfg.DocsPolicy,
+		maxEpochsStr,
+		maxCostStr,
+	)
+}
+
+func (m *Model) hasActiveTodos() bool {
+	if m.todos == nil {
+		return false
+	}
+	for _, item := range m.todos.Items() {
+		if item.Status == todo.StatusInProgress || item.Status == todo.StatusPending {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) startManualRollover(docsOverride *rollover.DocsPolicy, steeringHint string) tea.Cmd {
+	if m.streaming {
+		m.appendSystemNotice("Cannot start /rollover while a stream is in progress. Wait for it to finish or press Esc twice to interrupt.", true)
+		return nil
+	}
+	if m.rolloverState == rollover.StateCloseout {
+		m.appendSystemNotice("Rollover closeout is already in progress.", true)
+		return nil
+	}
+	if len(m.history) == 0 {
+		m.appendSystemNotice("Nothing to roll over yet — conversation history is empty.", true)
+		return nil
+	}
+	if m.llmProvider == nil && m.client == nil {
+		m.appendSystemNotice("Cannot start /rollover without an active model provider.", true)
+		return nil
+	}
+
+	policy := m.rolloverCfg.DocsPolicy
+	if docsOverride != nil {
+		policy = *docsOverride
+	}
+
+	return m.startRollover(session.RolloverTriggerManual, policy, steeringHint)
+}
+
+func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, steeringHint string) tea.Cmd {
+	prevEpoch := m.effectiveEpoch()
+	nextEpoch := prevEpoch + 1
+
+	m.rolloverPreHistory = append([]provider.Message(nil), m.history...)
+	m.rolloverTokensBefore = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
+	m.rolloverState = rollover.StateCloseout
+	m.rolloverTrigger = trigger
+	m.rolloverDocsPolicy = docsPolicy
+	m.rolloverDocsAllowed = (docsPolicy == rollover.DocsPolicyAlways)
+	m.rolloverSteeringHint = steeringHint
+	m.rolloverCloseoutStep = 0
+	m.rolloverCloseoutMaxSteps = m.rolloverCfg.CloseoutMaxSteps
+	if m.rolloverCloseoutMaxSteps <= 0 {
+		m.rolloverCloseoutMaxSteps = 4
+	}
+	if m.rolloverDocsAllowed && m.rolloverCloseoutMaxSteps < 8 {
+		m.rolloverCloseoutMaxSteps = 8
+	}
+
+	m.messages = append(m.messages, chatMessage{
+		role:    "system_nudge",
+		content: fmt.Sprintf("↻ Rolling over Epoch %d → Epoch %d (checkpointing via save_checkpoint… Esc twice to cancel)", prevEpoch, nextEpoch),
+	})
+
+	forced := trigger == session.RolloverTriggerHardThreshold
+	closeoutPrompt := rollover.BuildCloseoutPrompt(m.rolloverDocsAllowed, forced, steeringHint)
+	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(closeoutPrompt)))
+	m.updateViewportContent()
+
+	return m.launchStream()
+}
+
+func (m *Model) abortRollover(notice string) {
+	if m.rolloverPreHistory != nil {
+		m.history = m.rolloverPreHistory
+		m.rolloverPreHistory = nil
+	}
+	m.rolloverState = rollover.StateNormal
+	m.rolloverDocsAllowed = false
+	m.rolloverSteeringHint = ""
+	m.rolloverCloseoutStep = 0
+	m.appendSystemNotice(notice, true)
+	m.saveSession()
+}
+
+func (m *Model) commitEpochRollover(payload session.CheckpointPayload) tea.Cmd {
+	prevEpoch := m.effectiveEpoch()
+	nextEpoch := prevEpoch + 1
+
+	sourceHistory := m.rolloverPreHistory
+	if len(sourceHistory) == 0 {
+		sourceHistory = m.history
+	}
+
+	m.originalObjective = rollover.ResolveOriginalObjective(m.originalObjective, sourceHistory)
+
+	var pendingAsync []string
+	if m.todos != nil {
+		for _, item := range m.todos.Items() {
+			if item.Async && (item.Status == todo.StatusPending || item.Status == todo.StatusInProgress) {
+				pendingAsync = append(pendingAsync, item.Content)
+			}
+		}
+	}
+
+	pinned := rollover.CollectPinnedState(
+		context.Background(),
+		m.workDir,
+		m.originalObjective,
+		m.todos.Items(),
+		pendingAsync,
+	)
+
+	serializedPrev, err := session.MarshalProviderHistory(sourceHistory)
+	if err != nil {
+		m.abortRollover(fmt.Sprintf("Rollover failed: could not serialize Epoch %d history (%v) — staying in Epoch %d.", prevEpoch, err, prevEpoch))
+		return nil
+	}
+
+	now := time.Now().UTC()
+	turnCount := 0
+	for _, msg := range sourceHistory {
+		if msg.Role == provider.RoleUser {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					turnCount++
+					break
+				}
+			}
+		}
+	}
+
+	checkpoint := session.EpochCheckpoint{
+		Epoch:             prevEpoch,
+		CreatedAt:         now,
+		Trigger:           m.rolloverTrigger,
+		MessageCount:      len(serializedPrev),
+		TurnRange:         [2]int{1, max(turnCount, 1)},
+		TokensAtRollover:  m.rolloverTokensBefore,
+		ContextWindow:     m.contextWindowSize(),
+		EstimatedCostUSD:  m.estimateCost(),
+		DocsPolicyApplied: string(m.rolloverDocsPolicy),
+		Pinned:            pinned,
+		Payload:           payload,
+	}
+
+	if m.store != nil && m.sessionID != "" {
+		var prevInkwell []session.InkEntry
+		if existing, loadErr := m.store.Load(m.sessionID); loadErr == nil && existing != nil {
+			prevInkwell = existing.Inkwell
+		}
+		archive := &session.EpochArchive{
+			SessionID:  m.sessionID,
+			Epoch:      prevEpoch,
+			ClosedAt:   now,
+			Checkpoint: checkpoint,
+			Messages:   serializedPrev,
+			Inkwell:    prevInkwell,
+		}
+		relPath, err := m.store.SaveEpochArchive(m.sessionID, archive)
+		if err != nil {
+			m.abortRollover(fmt.Sprintf("Rollover failed: could not archive Epoch %d (%v) — staying in Epoch %d.", prevEpoch, err, prevEpoch))
+			return nil
+		}
+		checkpoint.ArchiveFile = relPath
+	}
+
+	// Atomically advance active epoch & reset transient provider state.
+	m.epochs = append(m.epochs, checkpoint)
+	m.currentEpoch = nextEpoch
+	m.msgSeq = 0
+	m.lastCallInputTokens = 0
+	m.lastCallCacheReadInputTokens = 0
+	m.lastCallCacheWriteInputTokens = 0
+	m.reasoningSignature = ""
+	m.reasoningDetails = nil
+	m.streamStep = 0
+	m.autoNudgeCount = 0
+	m.rolloverPreHistory = nil
+	m.rolloverDocsAllowed = false
+	steeringHint := m.rolloverSteeringHint
+	m.rolloverSteeringHint = ""
+	m.rolloverCloseoutStep = 0
+	m.rolloverState = rollover.StateNormal
+
+	bootstrapText := rollover.BuildBootstrapMessage(nextEpoch, prevEpoch, pinned, payload, steeringHint)
+	m.history = []provider.Message{
+		m.stampMessage(provider.BuildUserTextMessage(bootstrapText)),
+	}
+
+	// Clear active Inkwell in active session file now that Epoch N's Inkwell is archived.
+	if m.store != nil && m.sessionID != "" {
+		if existing, loadErr := m.store.Load(m.sessionID); loadErr == nil && existing != nil {
+			existing.Inkwell = []session.InkEntry{}
+			existing.Meta.CurrentEpoch = m.currentEpoch
+			existing.OriginalObjective = m.originalObjective
+			existing.Epochs = m.epochs
+			_ = m.store.Save(m.sessionID, existing)
+		}
+	}
+	m.saveSession()
+
+	m.messages = append(m.messages,
+		chatMessage{
+			role:    "system_nudge",
+			content: fmt.Sprintf("────────── Epoch %d (checkpointed from Epoch %d) ──────────", nextEpoch, prevEpoch),
+		},
+		chatMessage{
+			role:    "system_nudge",
+			content: fmt.Sprintf("↻ Epoch %d started — %d priority file(s) queued from Epoch %d checkpoint.", nextEpoch, len(payload.KeyFiles), prevEpoch),
+		},
+	)
+	m.updateViewportContent()
+
+	// Automatically orient and continue if active tasks exist or if triggered automatically.
+	if m.hasActiveTodos() || m.rolloverTrigger != session.RolloverTriggerManual {
+		return m.launchStream()
+	}
+
+	m.streaming = false
+	m.streamCh = nil
+	return nil
 }
