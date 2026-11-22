@@ -111,7 +111,7 @@ These defaults are currently hardcoded. Future: expose via CLI flags or config f
 
 ### Layer 2: Epoch Rollover Compaction (Continuous Ultra-Long Sessions)
 
-Heuristic tool-result compaction shrinks stale tool outputs within an epoch, but cannot eliminate trajectory rot, dead-end debugging prose, or attention dilution past ~45–50% context fill. **Epoch Rollover Compaction** automates a structured `closeout → save_checkpoint → fresh-context bootstrap` cycle under a single persistent session ID, archiving closed epochs as immutable, fully timestamped JSON files (`{id}.epoch-NNN.json`) and seeding the new epoch with deterministic pinned state + agent-synthesized lessons, key files/directories, and resume instructions.
+Heuristic tool-result compaction shrinks stale tool outputs within an epoch, but cannot eliminate trajectory rot, dead-end debugging prose, or attention dilution past ~45–50% context fill. **Epoch Rollover Compaction** automates a structured `closeout → save_checkpoint → fresh-context bootstrap` cycle under a single persistent session ID, archiving closed epochs as immutable, fully timestamped JSON files (`epochs/{id}/epoch-NNN.json`) and seeding the new epoch with deterministic pinned state + agent-synthesized lessons, key files/directories, and resume instructions.
 
 **Full design**: [`docs/epoch-rollover-design.md`](epoch-rollover-design.md)
 

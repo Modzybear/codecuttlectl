@@ -120,7 +120,7 @@ type EpochCheckpoint struct {
 	Epoch              int               `json:"epoch"`                // Completed epoch number (1, 2, ...)
 	CreatedAt          time.Time         `json:"created_at"`           // UTC timestamp of rollover commit
 	Trigger            RolloverTrigger   `json:"trigger"`              // "manual", "soft_threshold", "hard_threshold"
-	ArchiveFile        string            `json:"archive_file,omitempty"` // Relative filename e.g. "ses_a3f8c2d1.epoch-001.json"
+	ArchiveFile        string            `json:"archive_file,omitempty"` // Relative path e.g. "epochs/ses_a3f8c2d1/epoch-001.json"
 	MessageCount       int               `json:"message_count"`        // Number of messages archived in this epoch
 	TurnRange          [2]int            `json:"turn_range"`           // [firstTurn, lastTurn] inclusive
 	TokensAtRollover   int32             `json:"tokens_at_rollover"`   // Last API call total tokens before closeout
@@ -200,10 +200,12 @@ type SessionState struct {
 
 ```
 ~/.local/share/codecuttlectl/sessions/
-├── ses_a3f8c2d1.json              # Active session state: Meta, OriginalObjective, Epochs[], active epoch Messages & Inkwell, Todos, Audit
-├── ses_a3f8c2d1.epoch-001.json    # Immutable archive of Epoch 1: EpochArchive{Meta, Checkpoint, Messages, Inkwell}
-├── ses_a3f8c2d1.epoch-002.json    # Immutable archive of Epoch 2: EpochArchive{Meta, Checkpoint, Messages, Inkwell}
-└── ...
+├── ses_a3f8c2d1.json                 # Active session state: Meta, OriginalObjective, Epochs[], active epoch Messages & Inkwell, Todos, Audit
+└── epochs/
+    └── ses_a3f8c2d1/
+        ├── epoch-001.json            # Immutable archive of Epoch 1: EpochArchive{SessionID, Epoch, ClosedAt, Checkpoint, Messages, Inkwell}
+        ├── epoch-002.json            # Immutable archive of Epoch 2
+        └── ...
 ```
 
 ```go
@@ -220,16 +222,15 @@ type EpochArchive struct {
 
 **Why this layout is optimal:**
 1. **O(active epoch) save speed**: Every tool call triggers `saveSession()`. Keeping only the active epoch's `Messages` and `Inkwell` in `{id}.json` keeps writes fast and bounded even in Epoch 20.
-2. **Immutable indexing units**: Once `ses_a3f8c2d1.epoch-001.json` is renamed into place, it never changes. A future indexer (SQLite FTS5, pgvector, or Optic Lobe) can ingest each closed archive file exactly once, keyed by `(session_id, epoch, msg.id)`.
-3. **Directory-scan safety & cascade cleanup (`FileStore` invariant)**:
-   - `FileStore.List()` and `FileStore.Prune()` scan `*.json` files in `sessions/` and partially decode `{"meta": ...}`. Because `{id}.epoch-NNN.json` has no top-level `"meta"` field, failing to filter archive filenames would produce ghost entries in `--list-sessions` and cause `Prune()` to delete active epoch archives (zero `UpdatedAt < cutoff`).
-   - Therefore, `FileStore` must define `isEpochArchiveFile(name)` (`strings.Contains(name, ".epoch-") && strings.HasSuffix(name, ".json")`) and skip archive files during top-level directory scans.
-   - `FileStore.Delete(id)` and `FileStore.Prune(maxAge)` cascade-delete all matching `{id}.epoch-*.json` archives only when removing the parent `{id}.json`.
+2. **Immutable indexing units**: Once `epochs/ses_a3f8c2d1/epoch-001.json` is renamed into place, it never changes. A future indexer (SQLite FTS5, pgvector, or Optic Lobe) can ingest each closed archive file exactly once, keyed by `(session_id, epoch, msg.id)`.
+3. **Full backwards- AND forward-compatibility (`FileStore` invariant)**:
+   - Because `FileStore.List()` and `FileStore.Prune()` already skip subdirectories (`if entry.IsDir() { continue }`), storing closed archives under `epochs/{id}/epoch-NNN.json` guarantees that **both** new and older `codecuttlectl` binaries can never mistake an epoch archive for a top-level session file or accidentally prune active archives.
+   - `FileStore.Delete(id)` and `FileStore.Prune(maxAge)` cascade-remove `epochs/{id}/` (`os.RemoveAll`) when removing the parent `{id}.json`.
 4. **Inkwell archival vs. cumulative accounting**:
    - On rollover commit, `EpochArchive.Inkwell` captures Epoch N's `InkEntry` slice, and the active `a.inkwell` / `state.Inkwell` resets to empty for Epoch N+1.
    - Meanwhile, `SessionMeta.Stats` (`InputTokens`, `OutputTokens`, `CacheReadInputTokens`, `CacheWriteInputTokens`, `ToolCalls`, `Turns`, `EstimatedCostUSD`) and `AuditTrail` remain strictly **cumulative** across all epochs of the session (never reset or double-counted).
 5. **Atomic commit sequence**:
-   1. Write `{id}.epoch-NNN.json.tmp` → `os.Rename` to `{id}.epoch-NNN.json`
+   1. Ensure `epochs/{id}/` exists (`0700`), write `epochs/{id}/epoch-NNN.json.tmp` → `os.Rename` to `epochs/{id}/epoch-NNN.json`
    2. Write updated `{id}.json.tmp` (with `CurrentEpoch = N+1`, `Epochs` appended, `Messages` reset to bootstrap seed, `Inkwell` cleared) → `os.Rename` to `{id}.json`
    - If a crash occurs after step 1 and before step 2, `{id}.json` still cleanly points to Epoch N with all messages intact; an unreferenced archive file is harmlessly overwritten on retry.
 
@@ -242,7 +243,7 @@ type Store interface {
 	// ... existing Create, Save, Load, List, Delete, Prune ...
 
 	// SaveEpochArchive atomically persists an immutable closed epoch archive
-	// and returns its relative archive filename (e.g. "ses_abc12345.epoch-001.json").
+	// and returns its relative archive path (e.g. "epochs/ses_abc12345/epoch-001.json").
 	SaveEpochArchive(id string, archive *EpochArchive) (string, error)
 
 	// LoadEpochArchive retrieves a specific closed epoch archive by session ID and epoch number.
@@ -410,7 +411,7 @@ To avoid interrupting atomic multi-file edits while still guaranteeing context n
 5. **`Commit` (Atomic Epoch Boundary)**
    - Harness collects fresh `PinnedState` (`git branch`, `git status --short`, `git diff --stat`, `git log -n 10 --oneline`, `Todos`, `OriginalObjective`).
    - Constructs `EpochCheckpoint` and `EpochArchive`.
-   - Atomically persists `{id}.epoch-NNN.json` then updates `{id}.json` with `CurrentEpoch = N + 1`.
+   - Atomically persists `epochs/{id}/epoch-NNN.json` then updates `{id}.json` with `CurrentEpoch = N + 1`.
    - **Clean provider state reset**: Clears `m.history` / `a.provHistory`, resets `lastCallInputTokens`, `reasoningDetails`, `reasoningSignature`, and any stale provider-specific signatures so Epoch N+1 starts with a 100% clean wire payload (zero stale OpenRouter `reasoning_details` or Gemini `ThoughtSignature`s crossing epoch boundaries).
 
 6. **`Bootstrapping` (Fresh Context "Get Your Bearings" Phase)**
@@ -472,7 +473,7 @@ To keep automated rollovers from polluting focused bugfix PRs while still suppor
 
 | Policy (`--rollover-docs`) | Session Checkpoint | Project READMEs / Docs | Best For |
 |---|---|---|---|
-| **`none`** *(default)* | Always saved to Session Store (`ses_<id>.epoch-NNN.json`) | Never touched during closeout | Bugfix PRs, surgical changes, clean git history |
+| **`none`** *(default)* | Always saved to Session Store (`epochs/{id}/epoch-NNN.json`) | Never touched during closeout | Bugfix PRs, surgical changes, clean git history |
 | **`milestone`** | Always saved to Session Store | Updated only when closeout triggers on a **green milestone** (completed todo + passing tests) | Multi-epoch feature branches |
 | **`always`** | Always saved to Session Store | Always prompts closeout agent to update affected READMEs/docs | Exploratory / long-lived architecture work (matches manual workflow) |
 
@@ -589,7 +590,7 @@ Replace the ad-hoc `if text == "/reset"` / `if text == "/plugins"` checks in `in
 
 ### Phase 3: Historical Retrieval & Indexing (Future Integration with Optic Lobe)
 1. **Epoch Indexer (`internal/index/` or Optic Lobe)**:
-   - Incrementally index immutable `{id}.epoch-NNN.json` files (messages, tool calls, timestamps, checkpoints) into SQLite FTS5 and/or pgvector.
+   - Incrementally index immutable `epochs/{id}/epoch-NNN.json` files (messages, tool calls, timestamps, checkpoints) into SQLite FTS5 and/or pgvector.
 2. **Internal retrieval tool (`search_session_history`)**:
    - Allow an agent in Epoch N to query prior epochs by keyword, time range, file path, or semantic similarity and pull exact historical snippets on demand without bloating the active window.
 
@@ -604,7 +605,7 @@ Replace the ad-hoc `if text == "/reset"` / `if text == "/plugins"` checks in `in
 | `internal/session/types.go` | `EpochCheckpoint`, `PinnedState`, `CheckpointPayload`, `EpochArchive`, `CurrentEpoch`, `OriginalObjective` |
 | `internal/session/message.go` | Timestamp & provenance fields on `Message` / `ContentItem` |
 | `internal/session/store.go` | `SaveEpochArchive`, `LoadEpochArchive`, `ListEpochArchives` on `Store` interface |
-| `internal/session/filestore.go` | Atomic `{id}.epoch-NNN.json` persistence and cascade delete/prune |
+| `internal/session/filestore.go` | Atomic `epochs/{id}/epoch-NNN.json` persistence and cascade delete/prune |
 | `internal/rollover/types.go` | `Config`, `State`, `DocsPolicy`, `RolloverTrigger` |
 | `internal/rollover/controller.go` | Two-watermark state machine, quiescent detection, cooldown & budget guards |
 | `internal/rollover/tool.go` | `save_checkpoint` tool definition, JSON unmarshaling, validation |
