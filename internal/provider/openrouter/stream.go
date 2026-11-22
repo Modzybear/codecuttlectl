@@ -49,6 +49,7 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 	}
 	tools := make(map[int]*toolCall)
 	toolBytes := 0
+	var reasoningDetails []provider.ReasoningDetail
 	var usage streamUsage
 	var finishReason, nativeFinishReason string
 	finished, done := false, false
@@ -80,7 +81,7 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 			if code == 429 {
 				partial := generated || finished
 				for _, choice := range chunk.Choices {
-					if choice.Delta.Content != "" || choice.Delta.Reasoning != "" || len(choice.Delta.ToolCalls) > 0 || choice.FinishReason != "" {
+					if choice.Delta.Content != "" || choice.Delta.Reasoning != "" || len(choice.Delta.ReasoningDetails) > 0 || len(choice.Delta.ToolCalls) > 0 || choice.FinishReason != "" {
 						partial = true
 					}
 				}
@@ -108,14 +109,14 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 				return fmt.Errorf("openrouter: unexpected completion choice %d", choice.Index)
 			}
 			delta := choice.Delta
-			if delta.Content != "" || delta.Reasoning != "" || len(delta.ToolCalls) > 0 {
+			if delta.Content != "" || delta.Reasoning != "" || len(delta.ReasoningDetails) > 0 || len(delta.ToolCalls) > 0 {
 				generated = true
 			}
 			if finished {
 				// OpenRouter's final usage frame may repeat the terminal choice
 				// with an empty delta (including role/content placeholders).
 				// Accept metadata, but never new content or a changed stop reason.
-				if delta.Content != "" || delta.Reasoning != "" || len(delta.ToolCalls) > 0 ||
+				if delta.Content != "" || delta.Reasoning != "" || len(delta.ReasoningDetails) > 0 || len(delta.ToolCalls) > 0 ||
 					(choice.FinishReason != "" && choice.FinishReason != finishReason) {
 					return fmt.Errorf("openrouter: content or conflicting finish reason after completion")
 				}
@@ -135,6 +136,12 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 				if err := emit(provider.ReasoningDeltaEvent{Text: delta.Reasoning}); err != nil {
 					return err
 				}
+			}
+			if len(delta.ReasoningDetails) > 0 {
+				// Accumulate structured reasoning_details (including encrypted Gemini
+				// thought signatures) without emitting visible deltas, so encrypted-only
+				// chunks do not block malformed-response retries.
+				reasoningDetails = mergeReasoningDetails(reasoningDetails, delta.ReasoningDetails)
 			}
 			if delta.Content != "" {
 				emittedVisible = true
@@ -264,6 +271,11 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 		indexes = append(indexes, index)
 	}
 	sort.Ints(indexes)
+	if len(reasoningDetails) > 0 {
+		if err := emit(provider.ReasoningSignatureEvent{Details: reasoningDetails}); err != nil {
+			return err
+		}
+	}
 	for _, index := range indexes {
 		tool := tools[index]
 		for _, event := range []provider.StreamEvent{
@@ -290,4 +302,89 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 		return emit(event)
 	}
 	return nil
+}
+
+// mergeReasoningDetails accumulates incremental delta.reasoning_details chunks in order.
+// Chunks with matching (Type, Index) and compatible ID are merged (appending Text for
+// reasoning.text and Summary for reasoning.summary, and keeping Signature/ID/Format/Data).
+// For reasoning.encrypted, items with different non-empty IDs (e.g. parallel Gemini tool
+// calls sharing index: 0) are always kept as distinct entries.
+func mergeReasoningDetails(acc []provider.ReasoningDetail, incoming []provider.ReasoningDetail) []provider.ReasoningDetail {
+	for _, item := range incoming {
+		merged := false
+		for i := range acc {
+			if !canMergeReasoningDetail(acc[i], item) {
+				continue
+			}
+			switch item.Type {
+			case "reasoning.text":
+				acc[i].Text += item.Text
+			case "reasoning.summary":
+				acc[i].Summary += item.Summary
+			case "reasoning.encrypted":
+				if item.Data != "" {
+					acc[i].Data += item.Data
+				}
+			default:
+				acc[i].Text += item.Text
+				acc[i].Summary += item.Summary
+				if item.Data != "" {
+					acc[i].Data += item.Data
+				}
+			}
+			if item.Signature != "" {
+				acc[i].Signature = item.Signature
+			}
+			if item.ID != "" {
+				acc[i].ID = item.ID
+			}
+			if item.Format != "" {
+				acc[i].Format = item.Format
+			}
+			merged = true
+			break
+		}
+		if !merged {
+			cp := item
+			if item.Index != nil {
+				idx := *item.Index
+				cp.Index = &idx
+			}
+			acc = append(acc, cp)
+		}
+	}
+	return acc
+}
+
+func canMergeReasoningDetail(existing, incoming provider.ReasoningDetail) bool {
+	if existing.Type != incoming.Type {
+		return false
+	}
+	if !sameIntPtr(existing.Index, incoming.Index) {
+		return false
+	}
+	// Never merge distinct IDs (especially parallel Gemini reasoning.encrypted items sharing index: 0).
+	if existing.ID != "" && incoming.ID != "" && existing.ID != incoming.ID {
+		return false
+	}
+	if existing.Format != "" && incoming.Format != "" && existing.Format != incoming.Format {
+		return false
+	}
+	// Distinct non-empty encrypted payloads at the same index without matching IDs should not be concatenated blindly.
+	if existing.Type == "reasoning.encrypted" && existing.Data != "" && incoming.Data != "" {
+		if existing.ID == "" && incoming.ID == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func sameIntPtr(a, b *int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }

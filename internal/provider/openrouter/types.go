@@ -1,6 +1,10 @@
 package openrouter
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/Modzybear/codecuttlectl/internal/provider"
+)
 
 // ProviderPrefs controls OpenRouter's automatic fallback and ZDR behavior.
 type ProviderPrefs struct {
@@ -30,11 +34,12 @@ type streamOptions struct {
 
 // chatMessage is a message in the OpenAI format.
 type chatMessage struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content"`
-	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Reasoning  string        `json:"reasoning,omitempty"`
+	Role             string                     `json:"role"`
+	Content          string                     `json:"content"`
+	ToolCalls        []oaiToolCall              `json:"tool_calls,omitempty"`
+	ToolCallID       string                     `json:"tool_call_id,omitempty"`
+	Reasoning        string                     `json:"reasoning,omitempty"`
+	ReasoningDetails []provider.ReasoningDetail `json:"reasoning_details,omitempty"`
 }
 
 // oaiTool is an OpenAI-format tool definition.
@@ -111,8 +116,9 @@ type chunkChoice struct {
 
 // chunkDelta is the incremental content in a streaming chunk.
 type chunkDelta struct {
-	Role      string        `json:"role,omitempty"`
-	Content   string        `json:"content,omitempty"`
-	ToolCalls []oaiToolCall `json:"tool_calls,omitempty"`
-	Reasoning string        `json:"reasoning,omitempty"`
+	Role             string                     `json:"role,omitempty"`
+	Content          string                     `json:"content,omitempty"`
+	ToolCalls        []oaiToolCall              `json:"tool_calls,omitempty"`
+	Reasoning        string                     `json:"reasoning,omitempty"`
+	ReasoningDetails []provider.ReasoningDetail `json:"reasoning_details,omitempty"`
 }
