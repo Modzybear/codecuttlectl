@@ -2151,6 +2151,14 @@ func (m *Model) restoreSession() {
 			}
 		}
 	}
+
+	// Sanitize restored history for the active target provider so legacy sessions
+	// missing provider signatures (e.g. pre-PR #75 Gemini tool_use turns without
+	// reasoning_details) and cross-provider resumes are wire-compatible before the
+	// next inference call. Valid signed turns remain intact.
+	if m.llmProvider != nil && len(m.history) > 0 {
+		m.history = provider.SanitizeHistoryForProvider(m.history, provider.EffectiveID(m.llmProvider))
+	}
 }
 
 // rebuildStateDictFromHistory reconstructs the state dictionary by replaying

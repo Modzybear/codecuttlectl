@@ -1358,9 +1358,14 @@ func (a *Agent) loadSession() error {
 	a.history = messages
 
 	// If using the provider interface (Ollama, etc.), also restore into provHistory.
-	// Use the direct provider deserialization to avoid lossy Bedrock SDK round-trip.
+	// Use the direct provider deserialization to avoid lossy Bedrock SDK round-trip,
+	// then sanitize for the active target provider so legacy unsigned tool turns
+	// (e.g. pre-PR #75 Gemini sessions) and cross-provider resumes are wire-compatible.
 	if a.provider != nil && len(state.Messages) > 0 {
-		a.provHistory = session.UnmarshalProviderHistory(state.Messages)
+		a.provHistory = provider.SanitizeHistoryForProvider(
+			session.UnmarshalProviderHistory(state.Messages),
+			provider.EffectiveID(a.provider),
+		)
 	}
 
 	// Restore todos
