@@ -137,7 +137,10 @@ type Model struct {
 	// Slash command registry & epoch rollover state
 	cmdReg                   *CommandRegistry
 	rolloverCfg              rollover.Config
+	rolloverCtrl             *rollover.Controller
 	rolloverState            rollover.State
+	rolloverArmedCtxPct      float64
+	rolloverGreenMilestone   bool
 	rolloverPreHistory       []provider.Message
 	rolloverDocsPolicy       rollover.DocsPolicy
 	rolloverDocsAllowed      bool
@@ -291,6 +294,7 @@ func New(cfg Config) Model {
 	if cfg.RolloverConfig != nil {
 		m.rolloverCfg = *cfg.RolloverConfig
 	}
+	m.rolloverCtrl = rollover.NewController(m.rolloverCfg)
 
 	if m.morph != nil {
 		m.swarmMgr = swarm.NewManager(m.morph, chanDispatcher{ch: m.swarmEventCh})
@@ -908,6 +912,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.launchStream()
 		}
 
+		// Evaluate automatic rollover at turn-idle quiescent boundary
+		if cmd, triggered := m.maybeAutoRollover(true); triggered {
+			return m, cmd
+		}
+
 		return m, nil
 
 	case StreamUsageMsg:
@@ -920,6 +929,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastCallInputTokens = msg.InputTokens
 			m.lastCallCacheReadInputTokens = msg.CacheReadInputTokens
 			m.lastCallCacheWriteInputTokens = msg.CacheWriteInputTokens
+			if m.rolloverCtrl != nil && (msg.InputTokens+msg.CacheReadInputTokens+msg.CacheWriteInputTokens) > 0 {
+				m.rolloverCtrl.MarkUsageSeen()
+			}
 		}
 		// Usage arrives after MessageStop. Continue reading for the channel close
 		// which will emit StreamDoneMsg to finalize the turn.
@@ -1210,6 +1222,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Track green task milestone for quiescent soft rollover:
+		// a completed todo sets the flag; any failing bash_exec clears it.
+		for _, r := range msg.Messages {
+			if r.Name == "bash_exec" && r.IsError {
+				m.rolloverGreenMilestone = false
+			}
+		}
+		if len(msg.TodoInputs) > 0 && m.todos != nil {
+			for _, item := range m.todos.Items() {
+				if item.Status == todo.StatusCompleted {
+					m.rolloverGreenMilestone = true
+					break
+				}
+			}
+		}
+
 		m.saveSession()
 		if m.rolloverState == rollover.StateCloseout {
 			m.rolloverCloseoutStep++
@@ -1219,6 +1247,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.abortRollover(fmt.Sprintf("Rollover aborted: closeout exceeded %d steps without a valid save_checkpoint — staying in Epoch %d.", m.rolloverCloseoutMaxSteps, m.effectiveEpoch()))
 				return m, nil
 			}
+		} else if cmd, triggered := m.maybeAutoRollover(false); triggered {
+			return m, cmd
 		}
 		m.streamStep++ // Track consecutive tool-use rounds for grounding
 
@@ -1463,6 +1493,9 @@ func (m *Model) launchStream() tea.Cmd {
 	if m.streamStep >= 2 && m.stateDict != nil {
 		effectiveSystem += "\n\n" + m.stateDict.render()
 	}
+	if m.rolloverState == rollover.StateArmed && m.rolloverArmedCtxPct > 0 {
+		effectiveSystem += "\n\n" + rollover.ArmedSystemHint(m.rolloverArmedCtxPct)
+	}
 
 	// Use the provider interface for streaming
 	if m.llmProvider != nil {
@@ -1669,6 +1702,10 @@ func (m *Model) submitMessage(text string) tea.Cmd {
 	if m.originalObjective == "" {
 		m.originalObjective = rollover.ResolveOriginalObjective("", []provider.Message{provider.BuildUserTextMessage(text)})
 	}
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnUserTurnStarted()
+	}
+	m.rolloverGreenMilestone = false
 
 	m.messages = append(m.messages, chatMessage{role: "user", content: text})
 	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(text)))
@@ -2317,7 +2354,7 @@ func (m *Model) renderStatusBar() string {
 	}
 
 	epochSuffix := ""
-	if m.effectiveEpoch() > 1 || m.rolloverState != rollover.StateNormal {
+	if m.effectiveEpoch() > 1 || m.rolloverState != rollover.StateNormal || m.rolloverCfg.AutoRollover {
 		epochBadge := fmt.Sprintf("E%d", m.effectiveEpoch())
 		switch m.rolloverState {
 		case rollover.StateArmed:
@@ -2326,6 +2363,10 @@ func (m *Model) renderStatusBar() string {
 			epochBadge += " (rollover)"
 		case rollover.StateBootstrapping:
 			epochBadge += " (orienting)"
+		default:
+			if m.rolloverCfg.AutoRollover {
+				epochBadge += " · auto"
+			}
 		}
 		epochSuffix = "  " + StatusDimStyle.Render(epochBadge)
 	}
@@ -3102,20 +3143,89 @@ func (m *Model) startManualRollover(docsOverride *rollover.DocsPolicy, steeringH
 	if docsOverride != nil {
 		policy = *docsOverride
 	}
+	allowDocs := policy == rollover.DocsPolicyAlways
 
-	return m.startRollover(session.RolloverTriggerManual, policy, steeringHint)
+	return m.startRollover(session.RolloverTriggerManual, policy, allowDocs, steeringHint, "")
 }
 
-func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, steeringHint string) tea.Cmd {
+func (m *Model) knownContextWindow() int32 {
+	if m.contextWindow > 0 {
+		return m.contextWindow
+	}
+	if m.client != nil {
+		return bedrock.LookupModel(m.client.ModelID()).ContextWindow
+	}
+	return 0
+}
+
+func (m *Model) isOrchestratorActive() bool {
+	if m.morph == nil || m.agent == nil {
+		return true
+	}
+	active := m.agent.ActiveNode()
+	if active == "" {
+		return true
+	}
+	node, ok := m.morph.Nodes[active]
+	if !ok {
+		return true
+	}
+	return node.IsPrimary
+}
+
+func (m *Model) maybeAutoRollover(turnIdle bool) (tea.Cmd, bool) {
+	if m.rolloverCtrl == nil || !m.rolloverCfg.AutoRollover || m.rolloverState == rollover.StateCloseout {
+		return nil, false
+	}
+
+	lastCallTotal := m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
+	obs := rollover.Observation{
+		CurrentEpoch:      m.effectiveEpoch(),
+		EpochTurns:        m.turnCount(),
+		LastCallTokens:    lastCallTotal,
+		ContextWindow:     m.knownContextWindow(),
+		CumulativeCostUSD: m.estimateCost(),
+		IsOrchestrator:    m.isOrchestratorActive(),
+		PendingAsyncTasks: m.activeSwarmTasks,
+		TurnIdle:          turnIdle,
+		GreenMilestone:    m.rolloverGreenMilestone,
+	}
+
+	dec := m.rolloverCtrl.Evaluate(obs)
+	m.rolloverState = m.rolloverCtrl.State()
+
+	switch dec.Action {
+	case rollover.ActionArm:
+		m.rolloverArmedCtxPct = dec.ContextPct
+		m.updateViewportContent()
+		return nil, false
+	case rollover.ActionBudgetPaused:
+		m.appendSystemNotice(dec.Reason, false)
+		return nil, false
+	case rollover.ActionTriggerCloseout:
+		m.rolloverArmedCtxPct = 0
+		return m.startRollover(dec.Trigger, m.rolloverCfg.DocsPolicy, dec.AllowDocWrites, "", dec.Reason), true
+	default:
+		if m.rolloverState == rollover.StateNormal {
+			m.rolloverArmedCtxPct = 0
+		}
+		return nil, false
+	}
+}
+
+func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, allowDocWrites bool, steeringHint string, reason string) tea.Cmd {
 	prevEpoch := m.effectiveEpoch()
 	nextEpoch := prevEpoch + 1
 
 	m.rolloverPreHistory = append([]provider.Message(nil), m.history...)
 	m.rolloverTokensBefore = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 	m.rolloverState = rollover.StateCloseout
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.SetState(rollover.StateCloseout)
+	}
 	m.rolloverTrigger = trigger
 	m.rolloverDocsPolicy = docsPolicy
-	m.rolloverDocsAllowed = (docsPolicy == rollover.DocsPolicyAlways)
+	m.rolloverDocsAllowed = allowDocWrites
 	m.rolloverSteeringHint = steeringHint
 	m.rolloverCloseoutStep = 0
 	m.rolloverCloseoutMaxSteps = m.rolloverCfg.CloseoutMaxSteps
@@ -3126,9 +3236,13 @@ func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollov
 		m.rolloverCloseoutMaxSteps = 8
 	}
 
+	banner := fmt.Sprintf("↻ Rolling over Epoch %d → Epoch %d (checkpointing via save_checkpoint… Esc twice to cancel)", prevEpoch, nextEpoch)
+	if reason != "" {
+		banner = fmt.Sprintf("↻ %s — Epoch %d → Epoch %d (checkpointing… Esc twice to cancel)", reason, prevEpoch, nextEpoch)
+	}
 	m.messages = append(m.messages, chatMessage{
 		role:    "system_nudge",
-		content: fmt.Sprintf("↻ Rolling over Epoch %d → Epoch %d (checkpointing via save_checkpoint… Esc twice to cancel)", prevEpoch, nextEpoch),
+		content: banner,
 	})
 
 	forced := trigger == session.RolloverTriggerHardThreshold
@@ -3145,9 +3259,13 @@ func (m *Model) abortRollover(notice string) {
 		m.rolloverPreHistory = nil
 	}
 	m.rolloverState = rollover.StateNormal
+	m.rolloverArmedCtxPct = 0
 	m.rolloverDocsAllowed = false
 	m.rolloverSteeringHint = ""
 	m.rolloverCloseoutStep = 0
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnCloseoutCancelled()
+	}
 	m.appendSystemNotice(notice, true)
 	m.saveSession()
 }
@@ -3247,10 +3365,15 @@ func (m *Model) commitEpochRollover(payload session.CheckpointPayload) tea.Cmd {
 	m.autoNudgeCount = 0
 	m.rolloverPreHistory = nil
 	m.rolloverDocsAllowed = false
+	m.rolloverArmedCtxPct = 0
+	m.rolloverGreenMilestone = false
 	steeringHint := m.rolloverSteeringHint
 	m.rolloverSteeringHint = ""
 	m.rolloverCloseoutStep = 0
 	m.rolloverState = rollover.StateNormal
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnEpochCommitted()
+	}
 
 	bootstrapText := rollover.BuildBootstrapMessage(nextEpoch, prevEpoch, pinned, payload, steeringHint)
 	m.history = []provider.Message{

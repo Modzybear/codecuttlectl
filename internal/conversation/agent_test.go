@@ -10,6 +10,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/provider"
 	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -311,5 +312,104 @@ func TestAgentRolloverFailureRestoresHistory(t *testing.T) {
 	}
 	if a.CurrentEpoch() != 1 || len(a.provHistory) != 1 {
 		t.Fatalf("expected original history preserved on rollback: epoch=%d len=%d", a.CurrentEpoch(), len(a.provHistory))
+	}
+}
+
+func TestAgentHeadlessAutoRolloverMidTurnAndSwarmGuard(t *testing.T) {
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	sessID, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	validCheckpoint := json.RawMessage(`{
+		"summary": "Reached hard threshold mid-turn",
+		"lessons_learned": ["Step counter resets cleanly on new epoch"],
+		"key_files": [{"path": "internal/conversation/rollover.go", "purpose": "Agent rollover"}],
+		"resume_instructions": "Return final result in Epoch 2"
+	}`)
+
+	prov := &scriptedConverseProvider{
+		id:            "openrouter:google/gemini-4-neon",
+		contextWindow: 100_000,
+		responses: []*provider.Response{
+			// Turn 1: normal reply at 20% context
+			{
+				Content: "turn 1 done",
+				Usage:   provider.Usage{InputTokens: 20_000, OutputTokens: 100},
+			},
+			// Turn 2, step 0: calls tool_info and hits 70% (hard threshold 65%)
+			{
+				ToolUses: []provider.ToolUseRequest{
+					{ToolUseID: "ti_1", Name: "tool_info", Input: json.RawMessage(`{}`)},
+				},
+				Usage: provider.Usage{InputTokens: 70_000, OutputTokens: 100},
+			},
+			// Automatic Closeout call: calls save_checkpoint
+			{
+				ToolUses: []provider.ToolUseRequest{
+					{ToolUseID: "cp_1", Name: rollover.SaveCheckpointToolName, Input: validCheckpoint},
+				},
+				Usage: provider.Usage{InputTokens: 72_000, OutputTokens: 100},
+			},
+			// Epoch 2 continuation (same Turn 2, fresh context!)
+			{
+				Content: "completed cleanly in Epoch 2",
+				Usage:   provider.Usage{InputTokens: 5_000, OutputTokens: 50},
+			},
+		},
+	}
+
+	rcfg := rollover.DefaultConfig()
+	rcfg.AutoRollover = true
+	rcfg.SoftPct = 0.45
+	rcfg.HardPct = 0.65
+	rcfg.MinEpochTurns = 2
+
+	a := &Agent{
+		provider:     prov,
+		store:        store,
+		sessionID:    sessID,
+		workDir:      t.TempDir(),
+		maxSteps:     3,
+		todos:        todo.NewList(),
+		currentEpoch: 1,
+		rolloverCtrl: rollover.NewController(rcfg),
+	}
+
+	if _, err := a.turnProvider(context.Background(), "turn 1 task"); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+	if a.CurrentEpoch() != 1 {
+		t.Fatalf("expected Epoch 1 after turn 1, got %d", a.CurrentEpoch())
+	}
+
+	out, err := a.turnProvider(context.Background(), "turn 2 heavy task")
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if out != "completed cleanly in Epoch 2" {
+		t.Fatalf("turn 2 output = %q, want %q", out, "completed cleanly in Epoch 2")
+	}
+	if a.CurrentEpoch() != 2 || len(a.Epochs()) != 1 || a.Epochs()[0].Trigger != session.RolloverTriggerHardThreshold {
+		t.Fatalf("expected hard-threshold rollover to Epoch 2, got epoch=%d epochs=%+v", a.CurrentEpoch(), a.Epochs())
+	}
+
+	// Verify non-orchestrator swarm node NEVER triggers automatic rollover even at 95%
+	a.morph = &swarm.Morphology{
+		Nodes: map[string]swarm.Node{
+			"orchestrator": {IsPrimary: true},
+			"deep_coder":   {IsPrimary: false},
+		},
+	}
+	a.activeNode = "deep_coder"
+	a.epochTurns = 5
+	a.lastCallTokens = 95_000
+	a.rolloverCtrl.MarkUsageSeen()
+	if a.maybeAutoRollover(context.Background(), true, false) {
+		t.Fatal("non-orchestrator swarm node must never trigger auto-rollover")
 	}
 }

@@ -63,8 +63,33 @@ func main() {
 		// Safety
 		autoApprove = flag.Bool("auto-approve", false, "Skip confirmation prompts for destructive operations (use in automated pipelines)")
 		auditLog    = flag.Bool("audit-log", false, "Emit structured JSON audit events to stderr")
+
+		// Epoch Rollover Compaction
+		autoRollover    = flag.Bool("auto-rollover", false, "Automatically checkpoint and roll over to a fresh epoch when context reaches threshold")
+		rolloverSoftPct = flag.Float64("rollover-soft-pct", 0.45, "Soft context utilization threshold (0.0-1.0) to arm rollover and wait for a quiescent boundary")
+		rolloverHardPct = flag.Float64("rollover-hard-pct", 0.65, "Hard context utilization threshold (0.0-1.0) to force closeout after the current tool round")
+		rolloverDocs    = flag.String("rollover-docs", "none", "Project doc update policy on rollover: 'none', 'milestone', or 'always'")
+		maxEpochs       = flag.Int("max-epochs", 0, "Maximum epochs allowed for automatic rollover (0 = unlimited)")
+		maxCost         = flag.Float64("max-cost", 0, "Maximum cumulative session cost in USD before pausing automatic rollover (0 = unlimited)")
 	)
 	flag.Parse()
+
+	docsPolicy, err := rollover.ParseDocsPolicy(*rolloverDocs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	rolloverCfg := rollover.DefaultConfig()
+	rolloverCfg.AutoRollover = *autoRollover
+	rolloverCfg.SoftPct = *rolloverSoftPct
+	rolloverCfg.HardPct = *rolloverHardPct
+	rolloverCfg.DocsPolicy = docsPolicy
+	rolloverCfg.MaxEpochs = *maxEpochs
+	rolloverCfg.MaxCostUSD = *maxCost
+	if err := rollover.ValidateConfig(rolloverCfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid rollover configuration: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Initialize audit logger
 	auditLogger := audit.NewLogger(os.Stderr, *auditLog)
@@ -368,7 +393,7 @@ func main() {
 
 	// One-shot mode: no TUI, just print result to stdout
 	if *oneShot != "" {
-		runOneShot(ctx, bedrockClient, genericPool, llmProvider, pluginMgr, promptMgr, store, *sessionID, systemPrompt, *workDir, *maxSteps, *verbose, *autoApprove, auditLogger, *oneShot, morph)
+		runOneShot(ctx, bedrockClient, genericPool, llmProvider, pluginMgr, promptMgr, store, *sessionID, systemPrompt, *workDir, *maxSteps, *verbose, *autoApprove, auditLogger, *oneShot, morph, &rolloverCfg)
 		return
 	}
 
@@ -376,19 +401,20 @@ func main() {
 	if *noTUI {
 		// Initialize the Agent for REPL
 		agent, err := conversation.NewAgent(conversation.Config{
-			Client:      bedrockClient,
-			Pool:        genericPool,
-			Provider:    llmProvider,
-			Morph:       morph,
-			PromptMgr:   promptMgr,
-			PluginMgr:   pluginMgr,
-			WorkDir:     *workDir,
-			MaxSteps:    *maxSteps,
-			Verbose:     *verbose,
-			AutoApprove: *autoApprove,
-			AuditLogger: auditLogger,
-			Store:       store,
-			SessionID:   *sessionID,
+			Client:         bedrockClient,
+			Pool:           genericPool,
+			Provider:       llmProvider,
+			Morph:          morph,
+			PromptMgr:      promptMgr,
+			PluginMgr:      pluginMgr,
+			WorkDir:        *workDir,
+			MaxSteps:       *maxSteps,
+			Verbose:        *verbose,
+			AutoApprove:    *autoApprove,
+			AuditLogger:    auditLogger,
+			Store:          store,
+			SessionID:      *sessionID,
+			RolloverConfig: &rolloverCfg,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error initializing agent: %v\n", err)
@@ -403,19 +429,20 @@ func main() {
 
 	// Initialize the Agent for TUI
 	agent, err := conversation.NewAgent(conversation.Config{
-		Client:      bedrockClient,
-		Pool:        genericPool,
-		Provider:    llmProvider,
-		Morph:       morph,
-		PromptMgr:   promptMgr,
-		PluginMgr:   pluginMgr,
-		WorkDir:     *workDir,
-		MaxSteps:    *maxSteps,
-		Verbose:     *verbose,
-		AutoApprove: *autoApprove,
-		AuditLogger: auditLogger,
-		Store:       store,
-		SessionID:   *sessionID,
+		Client:         bedrockClient,
+		Pool:           genericPool,
+		Provider:       llmProvider,
+		Morph:          morph,
+		PromptMgr:      promptMgr,
+		PluginMgr:      pluginMgr,
+		WorkDir:        *workDir,
+		MaxSteps:       *maxSteps,
+		Verbose:        *verbose,
+		AutoApprove:    *autoApprove,
+		AuditLogger:    auditLogger,
+		Store:          store,
+		SessionID:      *sessionID,
+		RolloverConfig: &rolloverCfg,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing agent: %v\n", err)
@@ -445,6 +472,7 @@ func main() {
 		Morph:          morph,
 		Agent:          agent,
 		Engine:         engine,
+		RolloverConfig: &rolloverCfg,
 	})
 
 	p := tea.NewProgram(model)
@@ -461,21 +489,22 @@ func main() {
 }
 
 // runOneShot executes a single message and exits (non-TUI, for scripting).
-func runOneShot(ctx context.Context, client *bedrock.Client, pool provider.Pool, llmProvider provider.Provider, pluginMgr *pluginhost.Manager, promptMgr *prompt.Manager, store session.Store, sessionID, system, workDir string, maxSteps int, verbose, autoApprove bool, auditLogger *audit.Logger, message string, morph *swarm.Morphology) {
+func runOneShot(ctx context.Context, client *bedrock.Client, pool provider.Pool, llmProvider provider.Provider, pluginMgr *pluginhost.Manager, promptMgr *prompt.Manager, store session.Store, sessionID, system, workDir string, maxSteps int, verbose, autoApprove bool, auditLogger *audit.Logger, message string, morph *swarm.Morphology, rolloverCfg *rollover.Config) {
 	agent, err := conversation.NewAgent(conversation.Config{
-		Client:      client,
-		Pool:        pool,
-		Provider:    llmProvider,
-		Morph:       morph,
-		PromptMgr:   promptMgr,
-		PluginMgr:   pluginMgr,
-		WorkDir:     workDir,
-		MaxSteps:    maxSteps,
-		Verbose:     verbose,
-		AutoApprove: autoApprove,
-		AuditLogger: auditLogger,
-		Store:       store,
-		SessionID:   sessionID,
+		Client:         client,
+		Pool:           pool,
+		Provider:       llmProvider,
+		Morph:          morph,
+		PromptMgr:      promptMgr,
+		PluginMgr:      pluginMgr,
+		WorkDir:        workDir,
+		MaxSteps:       maxSteps,
+		Verbose:        verbose,
+		AutoApprove:    autoApprove,
+		AuditLogger:    auditLogger,
+		Store:          store,
+		SessionID:      sessionID,
+		RolloverConfig: rolloverCfg,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing agent: %v\n", err)

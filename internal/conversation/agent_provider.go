@@ -23,6 +23,10 @@ import (
 // turnProvider implements Turn using the provider interface.
 func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, error) {
 	a.turn++
+	a.epochTurns++
+	if a.rolloverCtrl != nil {
+		a.rolloverCtrl.OnUserTurnStarted()
+	}
 	if a.originalObjective == "" {
 		a.originalObjective = strings.TrimSpace(userMessage)
 	}
@@ -30,6 +34,7 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 
 	// Initialize state dictionary for this turn — tracks ground-truth about execution.
 	sd := newStateDict(userMessage)
+	greenMilestone := false
 
 	for step := 0; step < a.maxSteps; step++ {
 		effectivePrompt := a.effectiveSystemPrompt()
@@ -40,6 +45,9 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		// don't need this — they maintain their own world state effectively.
 		if step >= 2 && a.needsGroundingAssist() {
 			effectivePrompt += "\n\n" + sd.render()
+		}
+		if hint := a.armedSystemHint(); hint != "" {
+			effectivePrompt += "\n\n" + hint
 		}
 
 		req := provider.Request{
@@ -84,12 +92,17 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 			a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildAssistantMessage(assistBlocks)))
 		}
 		a.lastCallTokens = resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens
+		a.recordProviderCost(resp.Usage)
+		if a.rolloverCtrl != nil && a.lastCallTokens > 0 {
+			a.rolloverCtrl.MarkUsageSeen()
+		}
 
 		// If no tool calls, we're done
 		if len(resp.ToolUses) == 0 {
 			// Try to extract a plan from the model's final response for the todo panel
 			a.maybeUpdatePlanFromText(resp.Content)
 			a.flushSessionProvider()
+			a.maybeAutoRollover(ctx, true, greenMilestone)
 			return resp.Content, nil
 		}
 
@@ -152,6 +165,12 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 				Content:   result,
 				IsError:   isErr,
 			})
+			if toolUse.Name == "bash_exec" && isErr {
+				greenMilestone = false
+			}
+			if toolUse.Name == "todo_manage" && !isErr && a.hasCompletedTodo() {
+				greenMilestone = true
+			}
 		}
 
 		// Add tool results as a user message
@@ -165,6 +184,12 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		a.compactProviderHistory(resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens)
 
 		a.flushSessionProvider()
+
+		// Evaluate mid-turn automatic epoch rollover (reset step counter on new epoch).
+		if a.maybeAutoRollover(ctx, false, greenMilestone) {
+			step = -1
+			greenMilestone = false
+		}
 
 		// Reconciler check
 		advice := a.reconciler.Advise(a.inkwell)
@@ -182,6 +207,10 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 // streamTurnProvider implements StreamTurn using the provider interface.
 func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb StreamCallback) (string, error) {
 	a.turn++
+	a.epochTurns++
+	if a.rolloverCtrl != nil {
+		a.rolloverCtrl.OnUserTurnStarted()
+	}
 	if a.originalObjective == "" {
 		a.originalObjective = strings.TrimSpace(userMessage)
 	}
@@ -189,12 +218,16 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 
 	// State dictionary for grounding (only used for small models)
 	sd := newStateDict(userMessage)
+	greenMilestone := false
 
 	for step := 0; step < a.maxSteps; step++ {
 		// For smaller/local models, append state dictionary to system prompt.
 		effectivePrompt := a.effectiveSystemPrompt()
 		if step >= 2 && a.needsGroundingAssist() {
 			effectivePrompt += "\n\n" + sd.render()
+		}
+		if hint := a.armedSystemHint(); hint != "" {
+			effectivePrompt += "\n\n" + hint
 		}
 
 		req := provider.Request{
@@ -290,9 +323,18 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 
 				case provider.UsageEvent:
 					a.recordTokenUsage(e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens, step)
+					a.recordProviderCost(provider.Usage{
+						InputTokens:      e.InputTokens,
+						OutputTokens:     e.OutputTokens,
+						CacheReadTokens:  e.CacheReadTokens,
+						CacheWriteTokens: e.CacheWriteTokens,
+					})
 					if !e.InputTokensUnknown {
 						lastCallTotalTokens = e.InputTokens + e.CacheReadTokens + e.CacheWriteTokens
 						a.lastCallTokens = lastCallTotalTokens
+						if a.rolloverCtrl != nil && lastCallTotalTokens > 0 {
+							a.rolloverCtrl.MarkUsageSeen()
+						}
 					}
 
 				case provider.StreamErrorEvent:
@@ -367,6 +409,7 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		// If no tool calls, we're done
 		if len(toolCalls) == 0 {
 			a.flushSessionProvider()
+			a.maybeAutoRollover(ctx, true, greenMilestone)
 			if cb != nil {
 				cb(StreamEvent{Type: "done"})
 			}
@@ -418,6 +461,12 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 				Content:   result,
 				IsError:   isErr,
 			})
+			if tc.name == "bash_exec" && isErr {
+				greenMilestone = false
+			}
+			if tc.name == "todo_manage" && !isErr && a.hasCompletedTodo() {
+				greenMilestone = true
+			}
 
 			if cb != nil {
 				cb(StreamEvent{Type: "tool_done", ToolName: tc.name, ToolUseID: tc.id})
@@ -434,6 +483,12 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		a.compactProviderHistory(lastCallTotalTokens)
 
 		a.flushSessionProvider()
+
+		// Evaluate mid-turn automatic epoch rollover (reset step counter on new epoch).
+		if a.maybeAutoRollover(ctx, false, greenMilestone) {
+			step = -1
+			greenMilestone = false
+		}
 
 		// Clear text buffer for next round
 		textBuf.Reset()
@@ -589,6 +644,9 @@ func (a *Agent) flushSessionProvider() {
 	meta.CurrentEpoch = a.CurrentEpoch()
 	meta.Stats.Turns = a.turn
 	meta.Stats.ToolCalls = max(meta.Stats.ToolCalls, a.archivedToolCalls+len(a.inkwell))
+	if a.cumulativeCostUSD > meta.Stats.EstimatedCostUSD {
+		meta.Stats.EstimatedCostUSD = a.cumulativeCostUSD
+	}
 
 	origObj := a.originalObjective
 	epochs := a.epochs

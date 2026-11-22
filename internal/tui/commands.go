@@ -65,10 +65,16 @@ func NewDefaultCommandRegistry() *CommandRegistry {
 			switch strings.ToLower(args[0]) {
 			case "on", "true", "1":
 				m.rolloverCfg.AutoRollover = true
+				if m.rolloverCtrl != nil {
+					m.rolloverCtrl.SetConfig(m.rolloverCfg)
+				}
 				m.appendSystemNotice("Auto-rollover enabled.\n"+m.formatAutoRolloverStatus(), false)
 			case "off", "false", "0":
 				m.rolloverCfg.AutoRollover = false
-				if m.rolloverState == rollover.StateArmed {
+				if m.rolloverCtrl != nil {
+					m.rolloverCtrl.SetConfig(m.rolloverCfg)
+					m.rolloverState = m.rolloverCtrl.State()
+				} else if m.rolloverState == rollover.StateArmed {
 					m.rolloverState = rollover.StateNormal
 				}
 				m.appendSystemNotice("Auto-rollover disabled.\n"+m.formatAutoRolloverStatus(), false)

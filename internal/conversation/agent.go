@@ -19,6 +19,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 	"github.com/Modzybear/codecuttlectl/internal/prompt"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/scaffold"
 	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/skills"
@@ -59,12 +60,16 @@ type Agent struct {
 	inkwell           []session.InkEntry
 	archivedToolCalls int
 	turn              int
+	epochTurns        int
 	dirty             bool // true when state needs flushing to disk
 	currentEpoch      int
 	originalObjective string
 	epochs            []session.EpochCheckpoint
 	msgSeq            int
 	lastCallTokens    int32
+	cumulativeCostUSD float64
+	armedCtxPct       float64
+	rolloverCtrl      *rollover.Controller
 
 	// Sandbox
 	workbench  []string
@@ -95,8 +100,9 @@ type Config struct {
 	AuditLogger *audit.Logger // Structured event logger (nil = no structured logs)
 
 	// Session persistence (optional — nil disables persistence)
-	Store     session.Store
-	SessionID string // If set, resume this session
+	Store          session.Store
+	SessionID      string           // If set, resume this session
+	RolloverConfig *rollover.Config // Optional epoch rollover config (nil = DefaultConfig)
 
 	// Swarm Dispatcher & Initial Node
 	InitialNode     string                // Explicit node ID to initialize (defaults to primary node)
@@ -182,6 +188,11 @@ func NewAgent(cfg Config) (*Agent, error) {
 		}
 	}
 
+	rcfg := rollover.DefaultConfig()
+	if cfg.RolloverConfig != nil {
+		rcfg = *cfg.RolloverConfig
+	}
+
 	agent := &Agent{
 		client:       cfg.Client,
 		pool:         cfg.Pool,
@@ -198,6 +209,7 @@ func NewAgent(cfg Config) (*Agent, error) {
 		approvalFunc: cfg.ApprovalFunc,
 		auditLogger:  cfg.AuditLogger,
 		reconciler:   inkwell.NewReconciler(),
+		rolloverCtrl: rollover.NewController(rcfg),
 		store:        cfg.Store,
 		sessionID:    cfg.SessionID,
 		workbench:    cfg.Workbench,
@@ -1314,6 +1326,7 @@ func (a *Agent) loadSession() error {
 	a.turn = state.Meta.Stats.Turns
 	a.currentEpoch = state.Meta.EffectiveEpoch()
 	a.originalObjective = state.OriginalObjective
+	a.cumulativeCostUSD = state.Meta.Stats.EstimatedCostUSD
 	if len(state.Epochs) > 0 {
 		a.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
 	}
@@ -1321,6 +1334,16 @@ func (a *Agent) loadSession() error {
 		a.archivedToolCalls = state.Meta.Stats.ToolCalls - len(a.inkwell)
 	}
 	a.msgSeq = len(a.provHistory)
+	for _, msg := range a.provHistory {
+		if msg.Role == provider.RoleUser {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					a.epochTurns++
+					break
+				}
+			}
+		}
+	}
 
 	return nil
 }

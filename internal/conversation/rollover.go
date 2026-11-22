@@ -3,12 +3,14 @@ package conversation
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
 	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/session"
+	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
 // CurrentEpoch returns the active 1-indexed epoch number for this agent session.
@@ -58,6 +60,91 @@ func (a *Agent) stampProviderMessage(msg provider.Message) provider.Message {
 // If closeout fails or context is cancelled, the current epoch history is restored
 // untouched and an error is returned.
 func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, steeringHint string) (*session.EpochCheckpoint, error) {
+	allowDocWrites := docsPolicy == rollover.DocsPolicyAlways
+	return a.rolloverInternal(ctx, session.RolloverTriggerManual, docsPolicy, allowDocWrites, steeringHint)
+}
+
+func (a *Agent) isOrchestratorActive() bool {
+	if a.morph == nil || a.activeNode == "" {
+		return true
+	}
+	node, ok := a.morph.Nodes[a.activeNode]
+	if !ok {
+		return true
+	}
+	return node.IsPrimary
+}
+
+func (a *Agent) recordProviderCost(usage provider.Usage) {
+	if est, ok := a.provider.(provider.CostEstimator); ok {
+		a.cumulativeCostUSD += est.EstimateCost(usage)
+	}
+}
+
+func (a *Agent) armedSystemHint() string {
+	if a.rolloverCtrl != nil && a.rolloverCtrl.State() == rollover.StateArmed && a.armedCtxPct > 0 {
+		return rollover.ArmedSystemHint(a.armedCtxPct)
+	}
+	return ""
+}
+
+// maybeAutoRollover evaluates automatic epoch rollover for headless/REPL provider loops.
+// Returns true if an epoch rollover was committed (caller should reset its step counter).
+func (a *Agent) maybeAutoRollover(ctx context.Context, turnIdle bool, greenMilestone bool) bool {
+	if a.rolloverCtrl == nil || !a.rolloverCtrl.Config().AutoRollover {
+		return false
+	}
+
+	var cw int32
+	if cwp, ok := a.provider.(provider.ContextWindowProvider); ok {
+		cw = cwp.ContextWindow()
+	}
+
+	obs := rollover.Observation{
+		CurrentEpoch:      a.CurrentEpoch(),
+		EpochTurns:        a.epochTurns,
+		LastCallTokens:    a.lastCallTokens,
+		ContextWindow:     cw,
+		CumulativeCostUSD: a.cumulativeCostUSD,
+		IsOrchestrator:    a.isOrchestratorActive(),
+		TurnIdle:          turnIdle,
+		GreenMilestone:    greenMilestone,
+	}
+
+	dec := a.rolloverCtrl.Evaluate(obs)
+	switch dec.Action {
+	case rollover.ActionArm:
+		a.armedCtxPct = dec.ContextPct
+		return false
+	case rollover.ActionBudgetPaused:
+		a.armedCtxPct = 0
+		if a.verbose {
+			log.Printf("[rollover] %s", dec.Reason)
+		}
+		return false
+	case rollover.ActionTriggerCloseout:
+		a.armedCtxPct = 0
+		if a.verbose {
+			log.Printf("[rollover] %s", dec.Reason)
+		}
+		_, err := a.rolloverInternal(ctx, dec.Trigger, a.rolloverCtrl.Config().DocsPolicy, dec.AllowDocWrites, "")
+		if err != nil {
+			if a.verbose {
+				log.Printf("[rollover] closeout failed: %v", err)
+			}
+			a.rolloverCtrl.OnCloseoutCancelled()
+			return false
+		}
+		return true
+	default:
+		if a.rolloverCtrl.State() == rollover.StateNormal {
+			a.armedCtxPct = 0
+		}
+		return false
+	}
+}
+
+func (a *Agent) rolloverInternal(ctx context.Context, trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, allowDocWrites bool, steeringHint string) (*session.EpochCheckpoint, error) {
 	if a.provider == nil {
 		return nil, fmt.Errorf("epoch rollover requires a provider-based agent")
 	}
@@ -67,8 +154,10 @@ func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, st
 
 	prevEpoch := a.CurrentEpoch()
 	nextEpoch := prevEpoch + 1
-	allowDocWrites := docsPolicy == rollover.DocsPolicyAlways
 	maxSteps := rollover.DefaultConfig().CloseoutMaxSteps
+	if a.rolloverCtrl != nil && a.rolloverCtrl.Config().CloseoutMaxSteps > 0 {
+		maxSteps = a.rolloverCtrl.Config().CloseoutMaxSteps
+	}
 	if allowDocWrites && maxSteps < 8 {
 		maxSteps = 8
 	}
@@ -76,11 +165,15 @@ func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, st
 	preHistory := append([]provider.Message(nil), a.provHistory...)
 	restoreOnErr := func(err error) (*session.EpochCheckpoint, error) {
 		a.provHistory = preHistory
+		if a.rolloverCtrl != nil {
+			a.rolloverCtrl.OnCloseoutCancelled()
+		}
 		return nil, err
 	}
 
 	closeoutTools := a.closeoutProviderToolDefs(allowDocWrites)
-	closeoutPrompt := rollover.BuildCloseoutPrompt(allowDocWrites, false, steeringHint)
+	forced := trigger == session.RolloverTriggerHardThreshold
+	closeoutPrompt := rollover.BuildCloseoutPrompt(allowDocWrites, forced, steeringHint)
 	a.provHistory = append(a.provHistory, a.stampProviderMessage(provider.BuildUserTextMessage(closeoutPrompt)))
 
 	var validatedPayload *session.CheckpointPayload
@@ -201,11 +294,12 @@ func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, st
 	checkpoint := session.EpochCheckpoint{
 		Epoch:             prevEpoch,
 		CreatedAt:         now,
-		Trigger:           session.RolloverTriggerManual,
+		Trigger:           trigger,
 		MessageCount:      len(serializedPrev),
 		TurnRange:         [2]int{1, max(a.turn, 1)},
 		TokensAtRollover:  a.lastCallTokens,
 		ContextWindow:     contextWindow,
+		EstimatedCostUSD:  a.cumulativeCostUSD,
 		DocsPolicyApplied: string(docsPolicy),
 		Pinned:            pinned,
 		Payload:           *validatedPayload,
@@ -232,8 +326,13 @@ func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, st
 	a.inkwell = nil
 	a.epochs = append(a.epochs, checkpoint)
 	a.currentEpoch = nextEpoch
+	a.epochTurns = 0
 	a.msgSeq = 0
 	a.lastCallTokens = 0
+	a.armedCtxPct = 0
+	if a.rolloverCtrl != nil {
+		a.rolloverCtrl.OnEpochCommitted()
+	}
 
 	bootstrapText := rollover.BuildBootstrapMessage(nextEpoch, prevEpoch, pinned, *validatedPayload, steeringHint)
 	a.provHistory = []provider.Message{
@@ -244,6 +343,18 @@ func (a *Agent) Rollover(ctx context.Context, docsPolicy rollover.DocsPolicy, st
 
 	cpCopy := checkpoint
 	return &cpCopy, nil
+}
+
+func (a *Agent) hasCompletedTodo() bool {
+	if a.todos == nil {
+		return false
+	}
+	for _, item := range a.todos.Items() {
+		if item.Status == todo.StatusCompleted {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) closeoutProviderToolDefs(allowDocWrites bool) []provider.ToolDefinition {
