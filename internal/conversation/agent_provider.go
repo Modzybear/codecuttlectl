@@ -328,6 +328,7 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 						OutputTokens:     e.OutputTokens,
 						CacheReadTokens:  e.CacheReadTokens,
 						CacheWriteTokens: e.CacheWriteTokens,
+						CostUSD:          e.CostUSD,
 					})
 					if !e.InputTokensUnknown {
 						lastCallTotalTokens = e.InputTokens + e.CacheReadTokens + e.CacheWriteTokens

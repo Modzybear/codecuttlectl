@@ -18,7 +18,7 @@ type Message struct {
 	ID        string        `json:"id,omitempty"`        // Monotonic or UUID per message ("msg_0001")
 	Epoch     int           `json:"epoch,omitempty"`     // 1-indexed epoch number (0 for legacy sessions)
 	Turn      int           `json:"turn,omitempty"`      // Session-global turn number
-	Timestamp time.Time     `json:"timestamp,omitempty"` // UTC creation timestamp
+	Timestamp time.Time     `json:"timestamp,omitzero"`  // UTC creation timestamp
 	NodeID    string        `json:"node_id,omitempty"`   // Swarm node ID (e.g. "orchestrator", "deep_coder")
 	Model     string        `json:"model,omitempty"`     // Effective provider/model ID
 	Role      string        `json:"role"`                // "user", "assistant"
@@ -32,7 +32,7 @@ type ContentItem struct {
 	Type string `json:"type"`
 
 	// Timestamp when this block was recorded (optional)
-	Timestamp time.Time `json:"timestamp,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitzero"`
 
 	// For Type=="text": the text content
 	Text string `json:"text,omitempty"`

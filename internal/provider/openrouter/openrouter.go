@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -482,6 +483,9 @@ func completionToResponse(c chatCompletion) *provider.Response {
 		resp.Usage = provider.Usage{
 			InputTokens:  int32(c.Usage.PromptTokens),
 			OutputTokens: int32(c.Usage.CompletionTokens),
+		}
+		if c.Usage.Cost != nil && !math.IsNaN(*c.Usage.Cost) && !math.IsInf(*c.Usage.Cost, 0) && *c.Usage.Cost >= 0 {
+			resp.Usage.CostUSD = *c.Usage.Cost
 		}
 	}
 

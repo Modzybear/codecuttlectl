@@ -76,6 +76,10 @@ func (a *Agent) isOrchestratorActive() bool {
 }
 
 func (a *Agent) recordProviderCost(usage provider.Usage) {
+	if usage.CostUSD > 0 {
+		a.cumulativeCostUSD += usage.CostUSD
+		return
+	}
 	if est, ok := a.provider.(provider.CostEstimator); ok {
 		a.cumulativeCostUSD += est.EstimateCost(usage)
 	}

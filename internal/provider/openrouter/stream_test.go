@@ -383,6 +383,28 @@ func TestStreamEncryptedOnlyReasoningStillRetriesMalformed(t *testing.T) {
 	}
 }
 
+func TestStreamUsageCostPreserved(t *testing.T) {
+	events := collectStream(t, sse(
+		`{"choices":[{"delta":{"content":"hello"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.0015}}`,
+		`[DONE]`,
+	))
+
+	var gotUsage *provider.UsageEvent
+	for _, event := range events {
+		if u, ok := event.(provider.UsageEvent); ok {
+			gotUsage = &u
+		}
+	}
+	if gotUsage == nil {
+		t.Fatal("expected UsageEvent")
+	}
+	if gotUsage.InputTokens != 100 || gotUsage.OutputTokens != 20 || gotUsage.CostUSD != 0.0015 {
+		t.Fatalf("unexpected usage: %+v (want 100, 20, 0.0015)", gotUsage)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

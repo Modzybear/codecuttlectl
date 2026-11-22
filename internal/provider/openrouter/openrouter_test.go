@@ -349,8 +349,9 @@ func TestBuildRequest_CoalescesConsecutiveUserMessages(t *testing.T) {
 	}
 }
 
-func TestCompletionToResponse_CopiesReasoningAndDetails(t *testing.T) {
+func TestCompletionToResponse_CopiesReasoningDetailsAndCost(t *testing.T) {
 	idx0 := 0
+	costVal := 0.0042
 	resp := completionToResponse(chatCompletion{
 		Choices: []chatChoice{
 			{
@@ -365,11 +366,20 @@ func TestCompletionToResponse_CopiesReasoningAndDetails(t *testing.T) {
 				},
 			},
 		},
+		Usage: &chatUsage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+			Cost:             &costVal,
+		},
 	})
 	if resp.Reasoning != "thought" {
 		t.Errorf("Reasoning = %q, want thought", resp.Reasoning)
 	}
 	if len(resp.ReasoningDetails) != 1 || resp.ReasoningDetails[0].Data != "enc" {
 		t.Errorf("ReasoningDetails = %+v, want 1 item", resp.ReasoningDetails)
+	}
+	if resp.Usage.CostUSD != 0.0042 {
+		t.Errorf("CostUSD = %v, want 0.0042", resp.Usage.CostUSD)
 	}
 }

@@ -68,7 +68,7 @@ func NewDefaultCommandRegistry() *CommandRegistry {
 				if m.rolloverCtrl != nil {
 					m.rolloverCtrl.SetConfig(m.rolloverCfg)
 				}
-				m.appendSystemNotice("Auto-rollover enabled.\n"+m.formatAutoRolloverStatus(), false)
+				m.appendSystemNotice("Auto-rollover enabled.\n\n"+m.formatAutoRolloverStatus(), false)
 			case "off", "false", "0":
 				m.rolloverCfg.AutoRollover = false
 				if m.rolloverCtrl != nil {
@@ -77,7 +77,7 @@ func NewDefaultCommandRegistry() *CommandRegistry {
 				} else if m.rolloverState == rollover.StateArmed {
 					m.rolloverState = rollover.StateNormal
 				}
-				m.appendSystemNotice("Auto-rollover disabled.\n"+m.formatAutoRolloverStatus(), false)
+				m.appendSystemNotice("Auto-rollover disabled.\n\n"+m.formatAutoRolloverStatus(), false)
 			default:
 				m.appendSystemNotice("Usage: /auto-rollover [on|off|status]", true)
 			}
@@ -159,13 +159,13 @@ func (r *CommandRegistry) Dispatch(m *Model, text string) (bool, tea.Cmd) {
 	return true, cmd.Run(m, fields[1:])
 }
 
-// HelpText formats all registered slash commands.
+// HelpText formats all registered slash commands in clean Markdown.
 func (r *CommandRegistry) HelpText() string {
 	var sb strings.Builder
-	sb.WriteString("Available slash commands:\n")
+	sb.WriteString("### Available Slash Commands\n\n")
 	for _, key := range r.order {
 		cmd := r.commands[key]
-		sb.WriteString(fmt.Sprintf("  %-38s %s\n", cmd.Usage, cmd.Description))
+		sb.WriteString(fmt.Sprintf("- `%s` — %s\n", cmd.Usage, cmd.Description))
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

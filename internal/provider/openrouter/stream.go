@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,8 +23,9 @@ const (
 // streamUsage keeps field presence distinct from an explicitly reported zero.
 // Usage chunks are cumulative snapshots, not increments.
 type streamUsage struct {
-	PromptTokens     *int32 `json:"prompt_tokens"`
-	CompletionTokens *int32 `json:"completion_tokens"`
+	PromptTokens     *int32   `json:"prompt_tokens"`
+	CompletionTokens *int32   `json:"completion_tokens"`
+	Cost             *float64 `json:"cost,omitempty"`
 }
 
 func sendStreamEvent(ctx context.Context, events chan<- provider.StreamEvent, event provider.StreamEvent) error {
@@ -102,6 +104,11 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 					return fmt.Errorf("openrouter: negative completion token count")
 				}
 				usage.CompletionTokens = n
+			}
+			if c := chunk.Usage.Cost; c != nil {
+				if !math.IsNaN(*c) && !math.IsInf(*c, 0) && *c >= 0 {
+					usage.Cost = c
+				}
 			}
 		}
 		for _, choice := range chunk.Choices {
@@ -230,7 +237,7 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 		return fmt.Errorf("openrouter: stream ended before finish reason: %w", io.ErrUnexpectedEOF)
 	}
 	if err, abnormal := classifyAbnormalFinish(finishReason, nativeFinishReason, emittedVisible); abnormal {
-		if usage.PromptTokens != nil || usage.CompletionTokens != nil {
+		if usage.PromptTokens != nil || usage.CompletionTokens != nil || usage.Cost != nil {
 			event := provider.UsageEvent{
 				InputTokensUnknown: usage.PromptTokens == nil || *usage.PromptTokens == 0,
 			}
@@ -239,6 +246,9 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 			}
 			if usage.CompletionTokens != nil {
 				event.OutputTokens = *usage.CompletionTokens
+			}
+			if usage.Cost != nil {
+				event.CostUSD = *usage.Cost
 			}
 			_ = emit(event)
 		}
@@ -291,13 +301,16 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 	if err := emit(provider.MessageStopEvent{StopReason: finishReason}); err != nil {
 		return err
 	}
-	if usage.PromptTokens != nil || usage.CompletionTokens != nil {
+	if usage.PromptTokens != nil || usage.CompletionTokens != nil || usage.Cost != nil {
 		event := provider.UsageEvent{InputTokensUnknown: usage.PromptTokens == nil}
 		if usage.PromptTokens != nil {
 			event.InputTokens = *usage.PromptTokens
 		}
 		if usage.CompletionTokens != nil {
 			event.OutputTokens = *usage.CompletionTokens
+		}
+		if usage.Cost != nil {
+			event.CostUSD = *usage.Cost
 		}
 		return emit(event)
 	}

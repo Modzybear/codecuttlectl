@@ -155,6 +155,9 @@ type Model struct {
 	totalOutputTokens          int32
 	totalCacheReadInputTokens  int32
 	totalCacheWriteInputTokens int32
+	totalToolCalls             int
+	totalTurns                 int
+	reportedCostUSD            float64
 
 	// Per-call stats (most recent API call — used for context window %)
 	lastCallInputTokens           int32
@@ -924,6 +927,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalOutputTokens += msg.OutputTokens
 		m.totalCacheReadInputTokens += msg.CacheReadInputTokens
 		m.totalCacheWriteInputTokens += msg.CacheWriteInputTokens
+		if msg.CostUSD > 0 {
+			m.reportedCostUSD += msg.CostUSD
+		}
 		// Partial usage must not erase the last authoritative context count.
 		if !msg.InputTokensUnknown {
 			m.lastCallInputTokens = msg.InputTokens
@@ -1183,6 +1189,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				isError: isErr,
 			})
 		}
+		m.totalToolCalls += len(msg.Messages)
 		m.updateViewportContent()
 
 		// If save_checkpoint succeeded during closeout, commit the epoch rollover now!
@@ -1623,6 +1630,7 @@ func (m *Model) readNextStreamEvent() tea.Cmd {
 					OutputTokens:          e.OutputTokens,
 					CacheReadInputTokens:  e.CacheReadTokens,
 					CacheWriteInputTokens: e.CacheWriteTokens,
+					CostUSD:               e.CostUSD,
 					InputTokensUnknown:    e.InputTokensUnknown,
 				}
 			case provider.RetryEvent:
@@ -1708,6 +1716,7 @@ func (m *Model) submitMessage(text string) tea.Cmd {
 	m.rolloverGreenMilestone = false
 
 	m.messages = append(m.messages, chatMessage{role: "user", content: text})
+	m.totalTurns++
 	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(text)))
 	m.viewport.SetContent(m.renderMessages())
 	m.viewport.GotoBottom()
@@ -2083,6 +2092,23 @@ func (m *Model) restoreSession() {
 	m.totalOutputTokens = state.Meta.Stats.OutputTokens
 	m.totalCacheReadInputTokens = state.Meta.Stats.CacheReadInputTokens
 	m.totalCacheWriteInputTokens = state.Meta.Stats.CacheWriteInputTokens
+	m.totalToolCalls = state.Meta.Stats.ToolCalls
+	if m.totalToolCalls == 0 {
+		for _, msg := range m.history {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.ToolResultBlock); ok {
+					m.totalToolCalls++
+				}
+			}
+		}
+	}
+	m.totalTurns = state.Meta.Stats.Turns
+	if m.totalTurns == 0 {
+		m.totalTurns = m.turnCount()
+	}
+	if state.Meta.Stats.EstimatedCostUSD > 0 && m.estimateCost() == 0 {
+		m.reportedCostUSD = state.Meta.Stats.EstimatedCostUSD
+	}
 
 	// Restore todos
 	if len(state.Todos) > 0 {
@@ -2222,6 +2248,8 @@ func (m *Model) saveSession() {
 	meta.Stats.OutputTokens = m.totalOutputTokens
 	meta.Stats.CacheReadInputTokens = m.totalCacheReadInputTokens
 	meta.Stats.CacheWriteInputTokens = m.totalCacheWriteInputTokens
+	meta.Stats.ToolCalls = m.totalToolCalls
+	meta.Stats.Turns = m.totalTurns
 	meta.Stats.EstimatedCostUSD = m.estimateCost()
 
 	var existingInkwell []session.InkEntry
@@ -2403,32 +2431,37 @@ func formatTokenCount(tokens int32) string {
 // estimateCost calculates an estimated dollar cost for the session's token usage.
 // Returns 0 for local providers (Ollama) since they have no API cost.
 // If a ModelPool is available, uses per-model pricing from the registry.
-// Otherwise falls back to provider estimation.
+// Otherwise falls back to provider estimation or direct reported provider cost.
 func (m *Model) estimateCost() float64 {
 	if m.pool != nil {
 		// TODO(multi-model): When auxiliary calls are wired (Phase 4+), track per-role
 		// token usage and aggregate costs across roles. See docs/multi-model-design.md
 		// "Cost Tracking Changes" section for the per-role TokenStats design.
-		return m.pool.EstimateCost(
+		c := m.pool.EstimateCost(
 			string(bedrock.RolePrimary),
 			int64(m.totalInputTokens),
 			int64(m.totalOutputTokens),
 			int64(m.totalCacheReadInputTokens),
 			int64(m.totalCacheWriteInputTokens),
 		)
+		if c > 0 {
+			return c
+		}
 	}
-	if m.llmProvider == nil {
-		return 0
+	if m.llmProvider != nil {
+		if ce, ok := m.llmProvider.(provider.CostEstimator); ok {
+			c := ce.EstimateCost(provider.Usage{
+				InputTokens:      int32(m.totalInputTokens),
+				OutputTokens:     int32(m.totalOutputTokens),
+				CacheWriteTokens: int32(m.totalCacheWriteInputTokens),
+				CacheReadTokens:  int32(m.totalCacheReadInputTokens),
+			})
+			if c > 0 {
+				return c
+			}
+		}
 	}
-	if ce, ok := m.llmProvider.(provider.CostEstimator); ok {
-		return ce.EstimateCost(provider.Usage{
-			InputTokens:      int32(m.totalInputTokens),
-			OutputTokens:     int32(m.totalOutputTokens),
-			CacheWriteTokens: int32(m.totalCacheWriteInputTokens),
-			CacheReadTokens:  int32(m.totalCacheReadInputTokens),
-		})
-	}
-	return 0
+	return m.reportedCostUSD
 }
 
 func (m *Model) renderInput() string {
@@ -2620,6 +2653,13 @@ func (m *Model) renderMessages() string {
 			} else {
 				lines = append(lines, ToolResultSuccessStyle.Width(m.width-6).Render("  ✓ "+truncateToolResult(msg.content, 200)), "")
 			}
+
+		case "system_nudge", "system":
+			maxW := m.width - 6
+			if maxW < 20 {
+				maxW = 20
+			}
+			lines = append(lines, StatusDimStyle.Width(maxW).Render("  "+msg.content), "")
 		}
 	}
 
@@ -3059,7 +3099,16 @@ func (m *Model) stampMessage(msg provider.Message) provider.Message {
 	if msg.Turn == 0 {
 		msg.Turn = m.turnCount()
 		if msg.Role == provider.RoleUser {
-			msg.Turn++
+			hasText := false
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					hasText = true
+					break
+				}
+			}
+			if hasText {
+				msg.Turn++
+			}
 		}
 	}
 	if msg.Timestamp.IsZero() {
@@ -3097,7 +3146,12 @@ func (m *Model) formatAutoRolloverStatus() string {
 		maxCostStr = fmt.Sprintf("$%.2f", m.rolloverCfg.MaxCostUSD)
 	}
 	return fmt.Sprintf(
-		"Auto-rollover: %s (Epoch %d, state: %s)\n  soft=%.0f%%  hard=%.0f%%  docs=%s  max-epochs=%s  max-cost=%s",
+		"### Auto-Rollover Status: %s\n\n"+
+			"- **Current Epoch**: Epoch %d (state: `%s`)\n"+
+			"- **Thresholds**: soft=%.0f%% · hard=%.0f%%\n"+
+			"- **Docs Policy**: `%s`\n"+
+			"- **Max Epochs**: %s\n"+
+			"- **Max Cost**: %s",
 		status,
 		m.effectiveEpoch(),
 		m.rolloverState,
@@ -3376,6 +3430,7 @@ func (m *Model) commitEpochRollover(payload session.CheckpointPayload) tea.Cmd {
 	}
 
 	bootstrapText := rollover.BuildBootstrapMessage(nextEpoch, prevEpoch, pinned, payload, steeringHint)
+	m.history = nil
 	m.history = []provider.Message{
 		m.stampMessage(provider.BuildUserTextMessage(bootstrapText)),
 	}

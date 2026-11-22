@@ -49,8 +49,21 @@ func TestCommandRegistryAndRolloverArgParsing(t *testing.T) {
 	if !handled {
 		t.Fatal("expected /help to be handled")
 	}
-	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].content, "/rollover") {
-		t.Fatalf("expected /help output to list /rollover, got %+v", m.messages)
+	if len(m.messages) == 0 {
+		t.Fatalf("expected /help output message, got empty")
+	}
+	helpOut := m.messages[len(m.messages)-1].content
+	if !strings.Contains(helpOut, "### Available Slash Commands") || !strings.Contains(helpOut, "- `/rollover") {
+		t.Fatalf("expected /help output to use Markdown bullets, got:\n%s", helpOut)
+	}
+	m.width = 100
+	rendered := m.renderMessages()
+	if strings.Count(rendered, "\n") < 5 {
+		t.Fatalf("expected rendered /help to span multiple lines, got:\n%s", rendered)
+	}
+	m.messages = append(m.messages, chatMessage{role: "system_nudge", content: "────────── Epoch 2 ──────────"})
+	if !strings.Contains(m.renderMessages(), "Epoch 2") {
+		t.Fatalf("expected renderMessages() to render system_nudge content")
 	}
 
 	// /epochs (initial)
@@ -421,6 +434,23 @@ func TestAutoRolloverArmedHintQuiescentTriggerAndBudget(t *testing.T) {
 	if m.currentEpoch != 2 || len(m.epochs) != 1 || m.epochs[0].Trigger != session.RolloverTriggerSoftThreshold {
 		t.Fatalf("unexpected post-auto-rollover state: epoch=%d epochs=%+v", m.currentEpoch, m.epochs)
 	}
+	if len(m.history) == 0 || m.history[0].Turn != 1 {
+		t.Fatalf("expected bootstrap message to have Turn=1, got %+v", m.history)
+	}
+	// Verify subsequent user turn gets Turn=2 and tool-result user message stays on Turn=2
+	userMsg := m.stampMessage(provider.BuildUserTextMessage("follow up in epoch 2"))
+	if userMsg.Turn != 2 {
+		t.Fatalf("expected follow-up user turn=2, got %d", userMsg.Turn)
+	}
+	m.history = append(m.history, userMsg)
+	toolResMsg := m.stampMessage(provider.BuildToolResultMessage([]provider.ToolResultBlock{
+		{ToolUseID: "t1", Name: "read_file", Content: "ok"},
+	}))
+	if toolResMsg.Turn != 2 {
+		t.Fatalf("expected tool-result message to stay on turn=2, got %d", toolResMsg.Turn)
+	}
+	// Restore history to just bootstrap before budget pause check below
+	m.history = m.history[:1]
 	if m.system != "base system prompt" {
 		t.Errorf("m.system was mutated: %q", m.system)
 	}
