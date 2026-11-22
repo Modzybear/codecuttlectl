@@ -200,3 +200,74 @@ func TestSanitizeHistoryForProvider_PreservesProvenanceMetadata(t *testing.T) {
 		t.Fatalf("provenance metadata lost across SanitizeHistoryForProvider: %+v", got[0])
 	}
 }
+
+func TestSanitizeHistoryForProvider_OrphanToolResultAndCrossProviderGemini(t *testing.T) {
+	// 1. Leading orphan ToolResultBlock (when knownToolCalls is empty) must be stripped
+	leadingOrphan := []Message{
+		{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				ToolResultBlock{ToolUseID: "orphan_1", Name: "read_file", Content: "stale"},
+				TextBlock{Text: "real question"},
+			},
+		},
+	}
+	res := SanitizeHistoryForProvider(leadingOrphan, "bedrock:us.anthropic.claude-opus-4-6-v1")
+	if len(res) != 1 || len(res[0].Content) != 1 {
+		t.Fatalf("expected leading orphan tool result to be dropped, got %+v", res)
+	}
+	if _, ok := res[0].Content[0].(TextBlock); !ok {
+		t.Fatalf("expected TextBlock to remain, got %T", res[0].Content[0])
+	}
+
+	// 2. Unsigned ReasoningBlock alongside TextBlock targeting Bedrock must drop the unsigned ReasoningBlock
+	unsignedBedrock := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentBlock{
+				ReasoningBlock{Text: "unsigned foreign thought"},
+				TextBlock{Text: "visible answer"},
+			},
+		},
+	}
+	resBedrock := SanitizeHistoryForProvider(unsignedBedrock, "bedrock:us.anthropic.claude-opus-4-6-v1")
+	if len(resBedrock) != 1 || len(resBedrock[0].Content) != 1 {
+		t.Fatalf("expected unsigned ReasoningBlock dropped for Bedrock, got %+v", resBedrock)
+	}
+	if tb, ok := resBedrock[0].Content[0].(TextBlock); !ok || tb.Text != "visible answer" {
+		t.Fatalf("expected only visible TextBlock, got %#v", resBedrock[0].Content[0])
+	}
+
+	// 3. Completed foreign unsigned tool calls (e.g. from Bedrock/Claude) targeting Google Gemini
+	// or OpenRouter Gemini must transcode to TextBlocks to avoid 400 missing thought_signature (Issue #62).
+	foreignToolHistory := []Message{
+		{
+			Role:  RoleAssistant,
+			Model: "bedrock:us.anthropic.claude-opus-4-6-v1",
+			Content: []ContentBlock{
+				ReasoningBlock{Text: "Claude thinking", Signature: "claude_sig"},
+				ToolUseBlock{ToolUseID: "claude_call_1", Name: "read_file", Input: []byte(`{"path":"main.go"}`)},
+			},
+		},
+		{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				ToolResultBlock{ToolUseID: "claude_call_1", Name: "read_file", Content: "package main"},
+			},
+		},
+	}
+	for _, target := range []string{"google:gemini-2.5-pro", "openrouter:google/gemini-4-neon"} {
+		san := SanitizeHistoryForProvider(foreignToolHistory, target)
+		if len(san) != 2 {
+			t.Fatalf("[%s] expected 2 messages, got %d", target, len(san))
+		}
+		for _, b := range san[0].Content {
+			if _, isTool := b.(ToolUseBlock); isTool {
+				t.Fatalf("[%s] expected unsigned foreign ToolUseBlock to be transcoded to TextBlock, got %#v", target, b)
+			}
+		}
+		if tb, ok := san[1].Content[0].(TextBlock); !ok || tb.Text == "" {
+			t.Fatalf("[%s] expected foreign ToolResultBlock to be transcoded to TextBlock, got %#v", target, san[1].Content[0])
+		}
+	}
+}

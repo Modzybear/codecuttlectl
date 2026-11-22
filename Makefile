@@ -2,6 +2,9 @@ BINARY_NAME := codecuttlectl
 BUILD_DIR := ./bin
 PLUGIN_DIR := $(BUILD_DIR)/plugins
 CMD_DIR := ./cmd/codecuttlectl
+INSTALL_PREFIX ?= /usr/local
+INSTALL_BIN_DIR := $(INSTALL_PREFIX)/bin
+INSTALL_PLUGIN_DIR := $(INSTALL_PREFIX)/lib/$(BINARY_NAME)/plugins
 GO := go
 
 # Build flags
@@ -11,13 +14,45 @@ GOFLAGS := -trimpath
 # Plugin sources
 PLUGINS := $(wildcard plugins/cuttlebone-*)
 
-.PHONY: all build build-plugins clean test lint run test-tui-smoke test-runtime-characterization validate
+.PHONY: all build build-plugins install install-plugins clean test test-race lint run test-tui-smoke test-runtime-characterization validate
 
 all: build build-plugins
 
 ## build: Compile the codecuttlectl binary
 build:
+	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
+
+## install: Freshly build and atomically install codecuttlectl and all plugins
+install: build install-plugins
+	@SUDO=""; \
+	if [ -d "$(INSTALL_BIN_DIR)" ]; then \
+		[ -w "$(INSTALL_BIN_DIR)" ] || SUDO="sudo"; \
+	elif [ -d "$(INSTALL_PREFIX)" ]; then \
+		[ -w "$(INSTALL_PREFIX)" ] || SUDO="sudo"; \
+	fi; \
+	$$SUDO mkdir -p "$(INSTALL_BIN_DIR)"; \
+	$$SUDO cp "$(BUILD_DIR)/$(BINARY_NAME)" "$(INSTALL_BIN_DIR)/.$(BINARY_NAME).new" && \
+	$$SUDO chmod 755 "$(INSTALL_BIN_DIR)/.$(BINARY_NAME).new" && \
+	$$SUDO mv -f "$(INSTALL_BIN_DIR)/.$(BINARY_NAME).new" "$(INSTALL_BIN_DIR)/$(BINARY_NAME)"
+	@ls -lh "$(INSTALL_BIN_DIR)/$(BINARY_NAME)"
+
+## install-plugins: Freshly build and atomically install all Cuttlebone plugins
+install-plugins: build-plugins
+	@SUDO=""; \
+	if [ -d "$(INSTALL_PLUGIN_DIR)" ]; then \
+		[ -w "$(INSTALL_PLUGIN_DIR)" ] || SUDO="sudo"; \
+	elif [ -d "$(INSTALL_PREFIX)" ]; then \
+		[ -w "$(INSTALL_PREFIX)" ] || SUDO="sudo"; \
+	fi; \
+	$$SUDO mkdir -p "$(INSTALL_PLUGIN_DIR)"; \
+	for plugin in $(PLUGINS); do \
+		name=$$(basename "$$plugin"); \
+		$$SUDO cp "$(PLUGIN_DIR)/$$name" "$(INSTALL_PLUGIN_DIR)/.$$name.new" && \
+		$$SUDO chmod 755 "$(INSTALL_PLUGIN_DIR)/.$$name.new" && \
+		$$SUDO mv -f "$(INSTALL_PLUGIN_DIR)/.$$name.new" "$(INSTALL_PLUGIN_DIR)/$$name"; \
+	done
+	@ls -lh "$(INSTALL_PLUGIN_DIR)"
 
 ## build-plugins: Compile all Cuttlebone plugin binaries
 build-plugins: $(PLUGINS)
@@ -35,6 +70,10 @@ run: all
 ## test: Run all unit tests
 test:
 	$(GO) test -v ./...
+
+## test-race: Run all unit tests with the Go race detector
+test-race:
+	$(GO) test -count=1 -race ./...
 
 ## test-tui-smoke: Build a temporary binary and test real terminal input offline
 test-tui-smoke:

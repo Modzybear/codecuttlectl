@@ -6,6 +6,7 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -125,21 +126,57 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 		return nil
 	}
 
-	isBedrockTarget := strings.HasPrefix(targetProvider, "bedrock")
-	isGoogleTarget := strings.HasPrefix(targetProvider, "google")
-	isOpenRouterTarget := strings.HasPrefix(targetProvider, "openrouter:")
+	targetLower := strings.ToLower(targetProvider)
+	isBedrockTarget := strings.HasPrefix(targetLower, "bedrock")
+	isGoogleTarget := strings.HasPrefix(targetLower, "google")
+	isOpenRouterTarget := strings.HasPrefix(targetLower, "openrouter:")
+	isOpenRouterGeminiTarget := strings.HasPrefix(targetLower, "openrouter:google/")
+
+	// Pre-scan all ToolResultBlock IDs present in msgs so we know which
+	// ToolUseBlocks represent completed historical calls vs in-flight calls.
+	completedToolResults := make(map[string]bool)
+	for _, m := range msgs {
+		if m.Role == RoleUser {
+			for _, b := range m.Content {
+				if trb, ok := b.(ToolResultBlock); ok && trb.ToolUseID != "" {
+					completedToolResults[trb.ToolUseID] = true
+				}
+			}
+		}
+	}
 
 	knownToolCalls := make(map[string]bool)
+	transcodedToolCalls := make(map[string]string) // ToolUseID -> sanitized tool name
 	var sanitized []Message
 
 	for _, msg := range msgs {
-		// Pre-scan tool_use IDs present in this message so reasoning.encrypted
-		// items with a non-empty ID can be validated against the same turn's tool calls.
+		// Pre-scan tool_use IDs and Gemini signature availability in this assistant message.
 		msgToolUseIDs := make(map[string]bool)
+		hasGeminiToolSig := false
 		if msg.Role == RoleAssistant {
 			for _, b := range msg.Content {
-				if tub, ok := b.(ToolUseBlock); ok && tub.ToolUseID != "" && tub.Name != "" {
-					msgToolUseIDs[tub.ToolUseID] = true
+				switch blk := b.(type) {
+				case ToolUseBlock:
+					if blk.ToolUseID != "" && blk.Name != "" {
+						msgToolUseIDs[blk.ToolUseID] = true
+						if blk.ThoughtSignature != "" && isGoogleTarget {
+							hasGeminiToolSig = true
+						}
+					}
+				}
+			}
+			if isOpenRouterGeminiTarget {
+				for _, b := range msg.Content {
+					if rb, ok := b.(ReasoningBlock); ok {
+						for _, d := range rb.ReasoningDetails {
+							if d.Type == "reasoning.encrypted" &&
+								strings.HasPrefix(strings.ToLower(d.Format), "google-gemini") &&
+								(d.ID == "" || msgToolUseIDs[d.ID]) {
+								hasGeminiToolSig = true
+								break
+							}
+						}
+					}
 				}
 			}
 		}
@@ -171,11 +208,7 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 						rb.ReasoningDetails = filterReasoningDetailsForOpenRouter(rb.ReasoningDetails, targetProvider, msgToolUseIDs)
 					}
 				}
-				// Drop empty ReasoningBlock (no text, no signature, no reasoning_details).
-				if rb.Text == "" && rb.Signature == "" && len(rb.ReasoningDetails) == 0 {
-					continue
-				}
-				cleanBlocks = append(cleanBlocks, rb)
+				// Extract human-readable reasoning text before checking whether Bedrock requires a signature.
 				if rb.Text != "" {
 					reasoningText = append(reasoningText, rb.Text)
 				} else {
@@ -187,6 +220,16 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 						}
 					}
 				}
+				// Bedrock rejects unsigned ReasoningBlocks; omit them from cleanBlocks
+				// (reasoningText is still preserved above so reasoning-only turns downgrade to TextBlock).
+				if isBedrockTarget && rb.Signature == "" {
+					continue
+				}
+				// Drop empty ReasoningBlock (no text, no signature, no reasoning_details).
+				if rb.Text == "" && rb.Signature == "" && len(rb.ReasoningDetails) == 0 {
+					continue
+				}
+				cleanBlocks = append(cleanBlocks, rb)
 			case ToolUseBlock:
 				if block.ToolUseID != "" && block.Name != "" {
 					tub := block
@@ -195,17 +238,41 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 					if !isGoogleTarget && tub.ThoughtSignature != "" {
 						tub.ThoughtSignature = ""
 					}
+					// Google Gemini and OpenRouter Gemini reject completed foreign ToolUseBlocks
+					// that lack a Gemini thought signature / reasoning.encrypted detail (Issue #62).
+					// Transcode unsigned completed foreign tool calls into plain text transcripts.
+					if (isGoogleTarget || isOpenRouterGeminiTarget) && !hasGeminiToolSig && completedToolResults[tub.ToolUseID] {
+						inputStr := strings.TrimSpace(string(tub.Input))
+						text := fmt.Sprintf("[Prior tool call: %s(%s)]", tub.Name, inputStr)
+						cleanBlocks = append(cleanBlocks, TextBlock{Text: text})
+						textBlocks = append(textBlocks, text)
+						transcodedToolCalls[tub.ToolUseID] = tub.Name
+						continue
+					}
 					knownToolCalls[block.ToolUseID] = true
 					cleanBlocks = append(cleanBlocks, tub)
 				}
 			case ToolResultBlock:
-				// Ensure tool result has valid non-empty ToolUseID and matches a known call if tool calls exist
 				if block.ToolUseID != "" {
 					trb := block
 					if trb.Name != "" {
 						trb.Name = SanitizeToolName(trb.Name)
 					}
-					if len(knownToolCalls) == 0 || knownToolCalls[block.ToolUseID] {
+					if toolName, transcoded := transcodedToolCalls[trb.ToolUseID]; transcoded {
+						name := trb.Name
+						if name == "" {
+							name = toolName
+						}
+						status := "ok"
+						if trb.IsError {
+							status = "error"
+						}
+						text := fmt.Sprintf("[Prior tool result (%s, %s): %s]", name, status, trb.Content)
+						cleanBlocks = append(cleanBlocks, TextBlock{Text: text})
+						textBlocks = append(textBlocks, text)
+						continue
+					}
+					if knownToolCalls[block.ToolUseID] {
 						cleanBlocks = append(cleanBlocks, trb)
 					}
 				}

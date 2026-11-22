@@ -48,7 +48,7 @@ func main() {
 		workDir              = flag.String("workdir", "", "Working directory (default: current directory)")
 		pluginDir            = flag.String("plugin-dir", "", "Directory containing Cuttlebone plugin binaries")
 		verbose              = flag.Bool("verbose", false, "Enable verbose/debug output")
-		maxSteps             = flag.Int("max-steps", 25, "Maximum tool-use iterations per turn")
+		maxSteps             = flag.Int("max-steps", 0, "Maximum tool-use iterations per turn (0 = unlimited)")
 		thinking             = flag.Bool("thinking", false, "Enable extended thinking/reasoning (model must support it)")
 		oneShot              = flag.String("message", "", "Single message mode: send this message and exit (no TUI)")
 		noTUI                = flag.Bool("no-tui", false, "Disable TUI, use plain REPL mode")
@@ -472,6 +472,7 @@ func main() {
 		Morph:          morph,
 		Agent:          agent,
 		Engine:         engine,
+		MaxSteps:       *maxSteps,
 		RolloverConfig: &rolloverCfg,
 	})
 

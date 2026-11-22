@@ -260,7 +260,7 @@ func (a *Agent) rolloverInternal(ctx context.Context, trigger session.RolloverTr
 				continue
 			}
 
-			output, status := a.executeTool(ctx, tu.Name, tu.Input)
+			output, status := a.executeTool(ctx, tu.Name, tu.Input, false)
 			resultBlocks = append(resultBlocks, provider.ToolResultBlock{
 				ToolUseID: tu.ToolUseID,
 				Name:      tu.Name,
