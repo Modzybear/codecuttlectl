@@ -19,6 +19,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 	"github.com/Modzybear/codecuttlectl/internal/prompt"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/scaffold"
 	"github.com/Modzybear/codecuttlectl/internal/session"
 	"github.com/Modzybear/codecuttlectl/internal/skills"
@@ -59,12 +60,17 @@ type Agent struct {
 	inkwell           []session.InkEntry
 	archivedToolCalls int
 	turn              int
+	epochTurns        int
 	dirty             bool // true when state needs flushing to disk
 	currentEpoch      int
 	originalObjective string
 	epochs            []session.EpochCheckpoint
-	msgSeq            int
-	lastCallTokens    int32
+	msgSeq                  int
+	lastCallTokens          int32
+	lastCallCacheReadTokens int32
+	cumulativeCostUSD       float64
+	armedCtxPct       float64
+	rolloverCtrl      *rollover.Controller
 
 	// Sandbox
 	workbench  []string
@@ -95,8 +101,9 @@ type Config struct {
 	AuditLogger *audit.Logger // Structured event logger (nil = no structured logs)
 
 	// Session persistence (optional — nil disables persistence)
-	Store     session.Store
-	SessionID string // If set, resume this session
+	Store          session.Store
+	SessionID      string           // If set, resume this session
+	RolloverConfig *rollover.Config // Optional epoch rollover config (nil = DefaultConfig)
 
 	// Swarm Dispatcher & Initial Node
 	InitialNode     string                // Explicit node ID to initialize (defaults to primary node)
@@ -182,6 +189,11 @@ func NewAgent(cfg Config) (*Agent, error) {
 		}
 	}
 
+	rcfg := rollover.DefaultConfig()
+	if cfg.RolloverConfig != nil {
+		rcfg = *cfg.RolloverConfig
+	}
+
 	agent := &Agent{
 		client:       cfg.Client,
 		pool:         cfg.Pool,
@@ -198,6 +210,7 @@ func NewAgent(cfg Config) (*Agent, error) {
 		approvalFunc: cfg.ApprovalFunc,
 		auditLogger:  cfg.AuditLogger,
 		reconciler:   inkwell.NewReconciler(),
+		rolloverCtrl: rollover.NewController(rcfg),
 		store:        cfg.Store,
 		sessionID:    cfg.SessionID,
 		workbench:    cfg.Workbench,
@@ -1314,6 +1327,9 @@ func (a *Agent) loadSession() error {
 	a.turn = state.Meta.Stats.Turns
 	a.currentEpoch = state.Meta.EffectiveEpoch()
 	a.originalObjective = state.OriginalObjective
+	a.cumulativeCostUSD = state.Meta.Stats.EstimatedCostUSD
+	a.lastCallTokens = state.Meta.Stats.LastCallContextTokens
+	a.lastCallCacheReadTokens = state.Meta.Stats.LastCallCacheReadTokens
 	if len(state.Epochs) > 0 {
 		a.epochs = append([]session.EpochCheckpoint(nil), state.Epochs...)
 	}
@@ -1321,6 +1337,16 @@ func (a *Agent) loadSession() error {
 		a.archivedToolCalls = state.Meta.Stats.ToolCalls - len(a.inkwell)
 	}
 	a.msgSeq = len(a.provHistory)
+	for _, msg := range a.provHistory {
+		if msg.Role == provider.RoleUser {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					a.epochTurns++
+					break
+				}
+			}
+		}
+	}
 
 	return nil
 }
@@ -1481,6 +1507,10 @@ func (a *Agent) Workbench() []string {
 
 // recordTokenUsage accumulates token usage and emits a structured log event.
 func (a *Agent) recordTokenUsage(inputTokens, outputTokens, cacheRead, cacheWrite int32, step int) {
+	a.recordTokenUsageWithCost(inputTokens, outputTokens, cacheRead, cacheWrite, 0, step)
+}
+
+func (a *Agent) recordTokenUsageWithCost(inputTokens, outputTokens, cacheRead, cacheWrite int32, costUSD float64, step int) {
 	a.auditTrail.TotalInputTokens += int64(inputTokens)
 	a.auditTrail.TotalOutputTokens += int64(outputTokens)
 	a.auditTrail.TotalCacheReadTokens += int64(cacheRead)
@@ -1504,8 +1534,14 @@ func (a *Agent) recordTokenUsage(inputTokens, outputTokens, cacheRead, cacheWrit
 			OutputTokens:          outputTokens,
 			CacheReadInputTokens:  cacheRead,
 			CacheWriteInputTokens: cacheWrite,
+			CostUSD:               costUSD,
 		})
 	}
+}
+
+func (a *Agent) recordProviderUsage(usage provider.Usage, step int) {
+	costUSD := a.recordProviderCost(usage)
+	a.recordTokenUsageWithCost(usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.CacheWriteTokens, costUSD, step)
 }
 
 // recordToolExec emits a structured tool execution event and updates audit timing.

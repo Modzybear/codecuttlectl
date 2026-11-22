@@ -178,28 +178,29 @@ func BuildBootstrapMessage(nextEpoch int, prevEpoch int, pinned session.PinnedSt
 	return sb.String()
 }
 
-// FormatEpochsTable formats a list of completed epoch checkpoints into a readable summary table.
+// FormatEpochsTable formats a list of completed epoch checkpoints into a readable GFM Markdown summary table.
 func FormatEpochsTable(currentEpoch int, epochs []session.EpochCheckpoint) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Session Epochs (Current: Epoch %d)\n\n", currentEpoch))
+	sb.WriteString(fmt.Sprintf("### Session Epochs (Current: Epoch %d)\n\n", currentEpoch))
 
 	if len(epochs) == 0 {
-		sb.WriteString("No prior epochs archived. This session is currently in its initial epoch (Epoch 1).\n")
+		sb.WriteString("No prior epochs archived. This session is currently in its initial epoch (Epoch 1).\n\n")
 		sb.WriteString("Use `/rollover` to manually checkpoint and start Epoch 2.")
 		return sb.String()
 	}
 
-	sb.WriteString(fmt.Sprintf("%-6s | %-19s | %-15s | %-12s | %-10s | %s\n", "Epoch", "Archived At (UTC)", "Trigger", "Tokens @ Roll", "Cost USD", "Summary"))
-	sb.WriteString(strings.Repeat("-", 100) + "\n")
+	sb.WriteString("| Epoch | Archived At (UTC) | Trigger | Tokens @ Roll | Cost USD | Summary |\n")
+	sb.WriteString("| :--- | :--- | :--- | ---: | ---: | :--- |\n")
 
 	for _, ep := range epochs {
 		dateStr := ep.CreatedAt.UTC().Format("2006-01-02 15:04:05")
 		summaryPreview := strings.ReplaceAll(ep.Payload.Summary, "\n", " ")
+		summaryPreview = strings.ReplaceAll(summaryPreview, "|", "\\|")
 		if runes := []rune(summaryPreview); len(runes) > 35 {
 			summaryPreview = string(runes[:32]) + "..."
 		}
 
-		sb.WriteString(fmt.Sprintf("Epoch %-1d | %-19s | %-15s | %-12d | $%-9.4f | %s\n",
+		sb.WriteString(fmt.Sprintf("| Epoch %d | %s | %s | %d | $%.4f | %s |\n",
 			ep.Epoch,
 			dateStr,
 			string(ep.Trigger),
@@ -209,5 +210,5 @@ func FormatEpochsTable(currentEpoch int, epochs []session.EpochCheckpoint) strin
 		))
 	}
 
-	return sb.String()
+	return strings.TrimRight(sb.String(), "\n")
 }

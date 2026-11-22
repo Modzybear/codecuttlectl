@@ -64,7 +64,8 @@ type StreamUsageMsg struct {
 	OutputTokens          int32
 	CacheReadInputTokens  int32
 	CacheWriteInputTokens int32
-	InputTokensUnknown    bool // Preserve last-known context when input usage is absent.
+	CostUSD               float64 // Direct provider-reported cost (optional)
+	InputTokensUnknown    bool    // Preserve last-known context when input usage is absent.
 }
 
 // StreamErrorMsg reports a streaming error.

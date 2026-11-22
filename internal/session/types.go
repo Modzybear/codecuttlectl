@@ -34,13 +34,15 @@ func (m SessionMeta) EffectiveEpoch() int {
 
 // Stats tracks aggregate metrics for a session.
 type Stats struct {
-	InputTokens           int32   `json:"input_tokens"`
-	OutputTokens          int32   `json:"output_tokens"`
-	CacheReadInputTokens  int32   `json:"cache_read_input_tokens"`
-	CacheWriteInputTokens int32   `json:"cache_write_input_tokens"`
-	ToolCalls             int     `json:"tool_calls"`
-	Turns                 int     `json:"turns"`
-	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
+	InputTokens             int32   `json:"input_tokens"`
+	OutputTokens            int32   `json:"output_tokens"`
+	CacheReadInputTokens    int32   `json:"cache_read_input_tokens"`
+	CacheWriteInputTokens   int32   `json:"cache_write_input_tokens"`
+	LastCallContextTokens   int32   `json:"last_call_context_tokens,omitempty"`
+	LastCallCacheReadTokens int32   `json:"last_call_cache_read_tokens,omitempty"`
+	ToolCalls               int     `json:"tool_calls"`
+	Turns                   int     `json:"turns"`
+	EstimatedCostUSD        float64 `json:"estimated_cost_usd"`
 }
 
 // SessionState is the full persisted state of a session.

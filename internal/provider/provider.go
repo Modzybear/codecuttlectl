@@ -152,6 +152,7 @@ type Usage struct {
 	OutputTokens     int32
 	CacheReadTokens  int32
 	CacheWriteTokens int32
+	CostUSD          float64 // Direct provider-reported cost (optional, e.g. OpenRouter)
 }
 
 // --- Stream Events ---
@@ -220,6 +221,7 @@ type UsageEvent struct {
 	OutputTokens     int32
 	CacheReadTokens  int32
 	CacheWriteTokens int32
+	CostUSD          float64 // Direct provider-reported cost (optional, e.g. OpenRouter)
 	// InputTokensUnknown marks usage snapshots with no reported input count.
 	// The zero value preserves existing adapters' authoritative count semantics.
 	InputTokensUnknown bool

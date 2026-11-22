@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -479,11 +480,41 @@ func completionToResponse(c chatCompletion) *provider.Response {
 	}
 
 	if c.Usage != nil {
+		var cached, cacheWrite int32
+		if c.Usage.PromptTokensDetails != nil {
+			cached = int32(c.Usage.PromptTokensDetails.CachedTokens)
+			cacheWrite = int32(c.Usage.PromptTokensDetails.CacheWriteTokens)
+		}
+		inTok, cacheReadTok, cacheWriteTok := normalizePromptTokens(int32(c.Usage.PromptTokens), cached, cacheWrite)
 		resp.Usage = provider.Usage{
-			InputTokens:  int32(c.Usage.PromptTokens),
-			OutputTokens: int32(c.Usage.CompletionTokens),
+			InputTokens:      inTok,
+			OutputTokens:     int32(c.Usage.CompletionTokens),
+			CacheReadTokens:  cacheReadTok,
+			CacheWriteTokens: cacheWriteTok,
+		}
+		if c.Usage.Cost != nil && !math.IsNaN(*c.Usage.Cost) && !math.IsInf(*c.Usage.Cost, 0) && *c.Usage.Cost >= 0 {
+			resp.Usage.CostUSD = *c.Usage.Cost
 		}
 	}
 
 	return resp
+}
+
+// normalizePromptTokens converts OpenRouter's inclusive prompt_tokens count
+// (which already includes cached_tokens and cache_write_tokens) into Codecuttle's
+// disjoint accounting where total input = InputTokens + CacheReadTokens + CacheWriteTokens.
+func normalizePromptTokens(totalPrompt, cached, cacheWrite int32) (input, cacheRead, cacheWriteOut int32) {
+	if cached > 0 {
+		cacheRead = cached
+	}
+	if cacheWrite > 0 {
+		cacheWriteOut = cacheWrite
+	}
+	if totalPrompt > 0 {
+		rem := totalPrompt - cacheRead - cacheWriteOut
+		if rem > 0 {
+			input = rem
+		}
+	}
+	return input, cacheRead, cacheWriteOut
 }

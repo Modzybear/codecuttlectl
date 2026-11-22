@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1745,5 +1746,54 @@ func TestFileStorePruneCascadesEpochArchives(t *testing.T) {
 	}
 	if len(epochs) != 0 {
 		t.Fatalf("expected 0 archives after prune, got %v", epochs)
+	}
+}
+
+func TestMessageAndContentItemZeroTimestampOmission(t *testing.T) {
+	// Zero timestamps on Message and ContentItem should be omitted from JSON (no "0001-01-01T00:00:00Z")
+	msg := Message{
+		Role: "user",
+		Blocks: []ContentItem{
+			{
+				Type: "text",
+				Text: "hello world",
+			},
+		},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "0001-01-01") || strings.Contains(string(data), "timestamp") {
+		t.Fatalf("expected zero timestamps to be omitted completely, got %s", string(data))
+	}
+
+	// Non-zero timestamps should serialize and round-trip cleanly
+	now := time.Date(2026, 4, 15, 12, 30, 0, 0, time.UTC)
+	msgWithTime := Message{
+		Role:      "assistant",
+		Timestamp: now,
+		Blocks: []ContentItem{
+			{
+				Type:      "text",
+				Text:      "acknowledged",
+				Timestamp: now,
+			},
+		},
+	}
+	dataWithTime, err := json.Marshal(msgWithTime)
+	if err != nil {
+		t.Fatalf("Marshal with time: %v", err)
+	}
+	if !strings.Contains(string(dataWithTime), "2026-04-15T12:30:00Z") {
+		t.Fatalf("expected timestamp to be present, got %s", string(dataWithTime))
+	}
+
+	var restored Message
+	if err := json.Unmarshal(dataWithTime, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !restored.Timestamp.Equal(now) || !restored.Blocks[0].Timestamp.Equal(now) {
+		t.Fatalf("restored timestamp mismatch: msg=%v block=%v want=%v", restored.Timestamp, restored.Blocks[0].Timestamp, now)
 	}
 }

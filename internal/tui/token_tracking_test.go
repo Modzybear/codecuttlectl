@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/swarm"
 	"github.com/Modzybear/codecuttlectl/internal/todo"
 )
 
@@ -243,5 +245,48 @@ func TestDraftDebounceTickMsg(t *testing.T) {
 	staleMsg := DraftDebounceTickMsg{ID: 2}
 	if staleMsg.ID == m.draftDebounceSeq {
 		t.Errorf("expected stale sequence ID not to match current debounce sequence")
+	}
+}
+
+func TestReportedCostAndStatsTracking(t *testing.T) {
+	m := New(Config{})
+
+	// Reported cost accumulates from StreamUsageMsg when pool estimator returns 0
+	updated, _ := m.Update(StreamUsageMsg{
+		InputTokens:  1000,
+		OutputTokens: 200,
+		CostUSD:      0.0035,
+	})
+	m = updated.(Model)
+	if m.reportedCostUSD != 0.0035 {
+		t.Fatalf("reportedCostUSD = %v, want 0.0035", m.reportedCostUSD)
+	}
+	if m.estimateCost() != 0.0035 {
+		t.Fatalf("estimateCost() = %v, want 0.0035", m.estimateCost())
+	}
+
+	// Async swarm worker cost accumulates into reportedCostUSD
+	updated, _ = m.Update(swarm.TokenUsageMsg{
+		Assignee:              "flash_coder",
+		InputTokens:           500,
+		OutputTokens:          100,
+		CacheReadInputTokens:  2000,
+		CostUSD:               0.0015,
+	})
+	m = updated.(Model)
+	if math.Abs(m.reportedCostUSD-0.0050) > 1e-9 {
+		t.Fatalf("reportedCostUSD after swarm task = %v, want 0.0050", m.reportedCostUSD)
+	}
+
+	// Tool call counting
+	updated, _ = m.Update(ContinueStreamMsg{
+		Messages: []provider.ToolResultBlock{
+			{Name: "read_file", Content: "file content"},
+			{Name: "edit_file", Content: "ok"},
+		},
+	})
+	m = updated.(Model)
+	if m.totalToolCalls != 2 {
+		t.Fatalf("totalToolCalls = %d, want 2", m.totalToolCalls)
 	}
 }

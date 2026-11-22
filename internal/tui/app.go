@@ -137,7 +137,10 @@ type Model struct {
 	// Slash command registry & epoch rollover state
 	cmdReg                   *CommandRegistry
 	rolloverCfg              rollover.Config
+	rolloverCtrl             *rollover.Controller
 	rolloverState            rollover.State
+	rolloverArmedCtxPct      float64
+	rolloverGreenMilestone   bool
 	rolloverPreHistory       []provider.Message
 	rolloverDocsPolicy       rollover.DocsPolicy
 	rolloverDocsAllowed      bool
@@ -152,6 +155,9 @@ type Model struct {
 	totalOutputTokens          int32
 	totalCacheReadInputTokens  int32
 	totalCacheWriteInputTokens int32
+	totalToolCalls             int
+	totalTurns                 int
+	reportedCostUSD            float64
 
 	// Per-call stats (most recent API call — used for context window %)
 	lastCallInputTokens           int32
@@ -291,6 +297,7 @@ func New(cfg Config) Model {
 	if cfg.RolloverConfig != nil {
 		m.rolloverCfg = *cfg.RolloverConfig
 	}
+	m.rolloverCtrl = rollover.NewController(m.rolloverCfg)
 
 	if m.morph != nil {
 		m.swarmMgr = swarm.NewManager(m.morph, chanDispatcher{ch: m.swarmEventCh})
@@ -575,6 +582,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalOutputTokens += msg.OutputTokens
 		m.totalCacheReadInputTokens += msg.CacheReadInputTokens
 		m.totalCacheWriteInputTokens += msg.CacheWriteInputTokens
+		if msg.CostUSD > 0 {
+			m.reportedCostUSD += msg.CostUSD
+		}
 		return m, m.listenSwarmEvents()
 
 	case swarm.TaskCompletedMsg:
@@ -605,7 +615,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingAsyncResults = append(m.pendingAsyncResults, resultText)
 			return m, m.listenSwarmEvents()
 		} else {
-			m.history = append(m.history, provider.BuildUserTextMessage(resultText))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(resultText)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system",
 				content: resultText,
@@ -613,7 +623,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-nudge the idle model so it immediately reviews the background task results
 			nudge := "A background task has completed. Review the injected results above and incorporate them into your response or notify the user."
-			m.history = append(m.history, provider.BuildUserTextMessage(nudge))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(nudge)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system_nudge",
 				content: "↻ auto-continuing to review background task...",
@@ -889,7 +899,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Flush any async results that arrived while we were streaming
 		if len(m.pendingAsyncResults) > 0 {
 			for _, res := range m.pendingAsyncResults {
-				m.history = append(m.history, provider.BuildUserTextMessage(res))
+				m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(res)))
 				m.messages = append(m.messages, chatMessage{
 					role:    "system",
 					content: res,
@@ -899,13 +909,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-nudge the model so it immediately reviews the background task results
 			nudge := "A background task has completed. Review the injected results above and incorporate them into your response."
-			m.history = append(m.history, provider.BuildUserTextMessage(nudge))
+			m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(nudge)))
 			m.messages = append(m.messages, chatMessage{
 				role:    "system_nudge",
 				content: "↻ auto-continuing to review background task...",
 			})
 			m.updateViewportContent()
 			return m, m.launchStream()
+		}
+
+		// Evaluate automatic rollover at turn-idle quiescent boundary
+		if cmd, triggered := m.maybeAutoRollover(true); triggered {
+			return m, cmd
 		}
 
 		return m, nil
@@ -915,11 +930,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalOutputTokens += msg.OutputTokens
 		m.totalCacheReadInputTokens += msg.CacheReadInputTokens
 		m.totalCacheWriteInputTokens += msg.CacheWriteInputTokens
+		if msg.CostUSD > 0 {
+			m.reportedCostUSD += msg.CostUSD
+		}
 		// Partial usage must not erase the last authoritative context count.
 		if !msg.InputTokensUnknown {
 			m.lastCallInputTokens = msg.InputTokens
 			m.lastCallCacheReadInputTokens = msg.CacheReadInputTokens
 			m.lastCallCacheWriteInputTokens = msg.CacheWriteInputTokens
+			if m.rolloverCtrl != nil && (msg.InputTokens+msg.CacheReadInputTokens+msg.CacheWriteInputTokens) > 0 {
+				m.rolloverCtrl.MarkUsageSeen()
+			}
 		}
 		// Usage arrives after MessageStop. Continue reading for the channel close
 		// which will emit StreamDoneMsg to finalize the turn.
@@ -1171,6 +1192,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				isError: isErr,
 			})
 		}
+		m.totalToolCalls += len(msg.Messages)
 		m.updateViewportContent()
 
 		// If save_checkpoint succeeded during closeout, commit the epoch rollover now!
@@ -1210,6 +1232,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Track green task milestone for quiescent soft rollover:
+		// a completed todo sets the flag; any failing bash_exec clears it.
+		for _, r := range msg.Messages {
+			if r.Name == "bash_exec" && r.IsError {
+				m.rolloverGreenMilestone = false
+			}
+		}
+		if len(msg.TodoInputs) > 0 && m.todos != nil {
+			for _, item := range m.todos.Items() {
+				if item.Status == todo.StatusCompleted {
+					m.rolloverGreenMilestone = true
+					break
+				}
+			}
+		}
+
 		m.saveSession()
 		if m.rolloverState == rollover.StateCloseout {
 			m.rolloverCloseoutStep++
@@ -1219,6 +1257,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.abortRollover(fmt.Sprintf("Rollover aborted: closeout exceeded %d steps without a valid save_checkpoint — staying in Epoch %d.", m.rolloverCloseoutMaxSteps, m.effectiveEpoch()))
 				return m, nil
 			}
+		} else if cmd, triggered := m.maybeAutoRollover(false); triggered {
+			return m, cmd
 		}
 		m.streamStep++ // Track consecutive tool-use rounds for grounding
 
@@ -1463,6 +1503,9 @@ func (m *Model) launchStream() tea.Cmd {
 	if m.streamStep >= 2 && m.stateDict != nil {
 		effectiveSystem += "\n\n" + m.stateDict.render()
 	}
+	if m.rolloverState == rollover.StateArmed && m.rolloverArmedCtxPct > 0 {
+		effectiveSystem += "\n\n" + rollover.ArmedSystemHint(m.rolloverArmedCtxPct)
+	}
 
 	// Use the provider interface for streaming
 	if m.llmProvider != nil {
@@ -1590,6 +1633,7 @@ func (m *Model) readNextStreamEvent() tea.Cmd {
 					OutputTokens:          e.OutputTokens,
 					CacheReadInputTokens:  e.CacheReadTokens,
 					CacheWriteInputTokens: e.CacheWriteTokens,
+					CostUSD:               e.CostUSD,
 					InputTokensUnknown:    e.InputTokensUnknown,
 				}
 			case provider.RetryEvent:
@@ -1669,8 +1713,13 @@ func (m *Model) submitMessage(text string) tea.Cmd {
 	if m.originalObjective == "" {
 		m.originalObjective = rollover.ResolveOriginalObjective("", []provider.Message{provider.BuildUserTextMessage(text)})
 	}
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnUserTurnStarted()
+	}
+	m.rolloverGreenMilestone = false
 
 	m.messages = append(m.messages, chatMessage{role: "user", content: text})
+	m.totalTurns++
 	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(text)))
 	m.viewport.SetContent(m.renderMessages())
 	m.viewport.GotoBottom()
@@ -2046,6 +2095,30 @@ func (m *Model) restoreSession() {
 	m.totalOutputTokens = state.Meta.Stats.OutputTokens
 	m.totalCacheReadInputTokens = state.Meta.Stats.CacheReadInputTokens
 	m.totalCacheWriteInputTokens = state.Meta.Stats.CacheWriteInputTokens
+	m.lastCallCacheReadInputTokens = state.Meta.Stats.LastCallCacheReadTokens
+	if state.Meta.Stats.LastCallContextTokens > m.lastCallCacheReadInputTokens {
+		m.lastCallInputTokens = state.Meta.Stats.LastCallContextTokens - m.lastCallCacheReadInputTokens
+	} else {
+		m.lastCallInputTokens = 0
+	}
+	m.lastCallCacheWriteInputTokens = 0
+	m.totalToolCalls = state.Meta.Stats.ToolCalls
+	if m.totalToolCalls == 0 {
+		for _, msg := range m.history {
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.ToolResultBlock); ok {
+					m.totalToolCalls++
+				}
+			}
+		}
+	}
+	m.totalTurns = state.Meta.Stats.Turns
+	if m.totalTurns == 0 {
+		m.totalTurns = m.turnCount()
+	}
+	if state.Meta.Stats.EstimatedCostUSD > 0 && m.estimateCost() == 0 {
+		m.reportedCostUSD = state.Meta.Stats.EstimatedCostUSD
+	}
 
 	// Restore todos
 	if len(state.Todos) > 0 {
@@ -2185,6 +2258,10 @@ func (m *Model) saveSession() {
 	meta.Stats.OutputTokens = m.totalOutputTokens
 	meta.Stats.CacheReadInputTokens = m.totalCacheReadInputTokens
 	meta.Stats.CacheWriteInputTokens = m.totalCacheWriteInputTokens
+	meta.Stats.LastCallContextTokens = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
+	meta.Stats.LastCallCacheReadTokens = m.lastCallCacheReadInputTokens
+	meta.Stats.ToolCalls = m.totalToolCalls
+	meta.Stats.Turns = m.totalTurns
 	meta.Stats.EstimatedCostUSD = m.estimateCost()
 
 	var existingInkwell []session.InkEntry
@@ -2269,23 +2346,25 @@ func (m *Model) renderStatusBar() string {
 	}
 	model := StatusModelStyle.Render(modelName)
 	regionStr := StatusDimStyle.Render(region)
-	plugins := StatusDimStyle.Render(fmt.Sprintf("%dp", m.pluginMgr.Count()))
-
-	// Token display: show total input (including cache), output, cache hit rate, and estimated cost
-	totalIn := m.totalInputTokens + m.totalCacheReadInputTokens + m.totalCacheWriteInputTokens
-	cacheHitPct := 0
-	if totalIn > 0 {
-		cacheHitPct = int(float64(m.totalCacheReadInputTokens) / float64(totalIn) * 100)
+	pluginCount := 0
+	if m.pluginMgr != nil {
+		pluginCount = m.pluginMgr.Count()
 	}
+	plugins := StatusDimStyle.Render(fmt.Sprintf("%dp", pluginCount))
+
+	// Token display: show total input (including cache), output, most-recent cache hit rate, and estimated cost
+	totalIn := m.totalInputTokens + m.totalCacheReadInputTokens + m.totalCacheWriteInputTokens
 	cost := m.estimateCost()
 
-	// Context window usage: based on the most recent API call's total input tokens.
-	// This represents how full the context window is RIGHT NOW (not cumulative).
+	// Context window usage & cache hit rate: based on the most recent API call's total input tokens.
+	// This represents how full the context window is and how well caching hit RIGHT NOW (not cumulative).
 	// Claude Opus 4.x on Bedrock: 200k input context window.
 	ctxUsed := m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 	ctxPct := 0
+	cacheHitPct := 0
 	if ctxUsed > 0 {
 		ctxPct = int(float64(ctxUsed) / float64(m.contextWindowSize()) * 100)
+		cacheHitPct = int(float64(m.lastCallCacheReadInputTokens) / float64(ctxUsed) * 100)
 	}
 
 	// Color the ctx% indicator based on usage level
@@ -2300,10 +2379,11 @@ func (m *Model) renderStatusBar() string {
 		ctxStyled = StatusDimStyle.Render(ctxStr)
 	}
 
-	// Build right-side status: tokens in/out, ctx%, and optionally cost
+	// Build right-side status: tokens in/out, ctx%, and optionally cache% + cost
 	var right string
-	if _, ok := m.llmProvider.(provider.CostEstimator); ok {
-		// Provider with cost API
+	_, hasCostEstimator := m.llmProvider.(provider.CostEstimator)
+	if hasCostEstimator || cost > 0 || m.lastCallCacheReadInputTokens > 0 || m.lastCallCacheWriteInputTokens > 0 || m.totalCacheReadInputTokens > 0 {
+		// Provider with cost/cache metrics (also stays visible during handoff to direct OpenRouter nodes)
 		tokenStr := fmt.Sprintf("%s in %s out %d%% cache ",
 			formatTokenCount(totalIn), formatTokenCount(m.totalOutputTokens), cacheHitPct)
 		tokens := StatusTokenStyle.Render(tokenStr) + ctxStyled + StatusTokenStyle.Render(fmt.Sprintf(" ~$%.2f", cost))
@@ -2317,7 +2397,7 @@ func (m *Model) renderStatusBar() string {
 	}
 
 	epochSuffix := ""
-	if m.effectiveEpoch() > 1 || m.rolloverState != rollover.StateNormal {
+	if m.effectiveEpoch() > 1 || m.rolloverState != rollover.StateNormal || m.rolloverCfg.AutoRollover {
 		epochBadge := fmt.Sprintf("E%d", m.effectiveEpoch())
 		switch m.rolloverState {
 		case rollover.StateArmed:
@@ -2326,6 +2406,10 @@ func (m *Model) renderStatusBar() string {
 			epochBadge += " (rollover)"
 		case rollover.StateBootstrapping:
 			epochBadge += " (orienting)"
+		default:
+			if m.rolloverCfg.AutoRollover {
+				epochBadge += " · auto"
+			}
 		}
 		epochSuffix = "  " + StatusDimStyle.Render(epochBadge)
 	}
@@ -2362,32 +2446,37 @@ func formatTokenCount(tokens int32) string {
 // estimateCost calculates an estimated dollar cost for the session's token usage.
 // Returns 0 for local providers (Ollama) since they have no API cost.
 // If a ModelPool is available, uses per-model pricing from the registry.
-// Otherwise falls back to provider estimation.
+// Otherwise falls back to provider estimation or direct reported provider cost.
 func (m *Model) estimateCost() float64 {
 	if m.pool != nil {
 		// TODO(multi-model): When auxiliary calls are wired (Phase 4+), track per-role
 		// token usage and aggregate costs across roles. See docs/multi-model-design.md
 		// "Cost Tracking Changes" section for the per-role TokenStats design.
-		return m.pool.EstimateCost(
+		c := m.pool.EstimateCost(
 			string(bedrock.RolePrimary),
 			int64(m.totalInputTokens),
 			int64(m.totalOutputTokens),
 			int64(m.totalCacheReadInputTokens),
 			int64(m.totalCacheWriteInputTokens),
 		)
+		if c > 0 {
+			return c
+		}
 	}
-	if m.llmProvider == nil {
-		return 0
+	if m.llmProvider != nil {
+		if ce, ok := m.llmProvider.(provider.CostEstimator); ok {
+			c := ce.EstimateCost(provider.Usage{
+				InputTokens:      int32(m.totalInputTokens),
+				OutputTokens:     int32(m.totalOutputTokens),
+				CacheWriteTokens: int32(m.totalCacheWriteInputTokens),
+				CacheReadTokens:  int32(m.totalCacheReadInputTokens),
+			})
+			if c > 0 {
+				return c
+			}
+		}
 	}
-	if ce, ok := m.llmProvider.(provider.CostEstimator); ok {
-		return ce.EstimateCost(provider.Usage{
-			InputTokens:      int32(m.totalInputTokens),
-			OutputTokens:     int32(m.totalOutputTokens),
-			CacheWriteTokens: int32(m.totalCacheWriteInputTokens),
-			CacheReadTokens:  int32(m.totalCacheReadInputTokens),
-		})
-	}
-	return 0
+	return m.reportedCostUSD
 }
 
 func (m *Model) renderInput() string {
@@ -2579,6 +2668,13 @@ func (m *Model) renderMessages() string {
 			} else {
 				lines = append(lines, ToolResultSuccessStyle.Width(m.width-6).Render("  ✓ "+truncateToolResult(msg.content, 200)), "")
 			}
+
+		case "system_nudge", "system":
+			maxW := m.width - 6
+			if maxW < 20 {
+				maxW = 20
+			}
+			lines = append(lines, StatusDimStyle.Width(maxW).Render("  "+msg.content), "")
 		}
 	}
 
@@ -3018,7 +3114,16 @@ func (m *Model) stampMessage(msg provider.Message) provider.Message {
 	if msg.Turn == 0 {
 		msg.Turn = m.turnCount()
 		if msg.Role == provider.RoleUser {
-			msg.Turn++
+			hasText := false
+			for _, b := range msg.Content {
+				if _, ok := b.(provider.TextBlock); ok {
+					hasText = true
+					break
+				}
+			}
+			if hasText {
+				msg.Turn++
+			}
 		}
 	}
 	if msg.Timestamp.IsZero() {
@@ -3056,7 +3161,12 @@ func (m *Model) formatAutoRolloverStatus() string {
 		maxCostStr = fmt.Sprintf("$%.2f", m.rolloverCfg.MaxCostUSD)
 	}
 	return fmt.Sprintf(
-		"Auto-rollover: %s (Epoch %d, state: %s)\n  soft=%.0f%%  hard=%.0f%%  docs=%s  max-epochs=%s  max-cost=%s",
+		"### Auto-Rollover Status: %s\n\n"+
+			"- **Current Epoch**: Epoch %d (state: `%s`)\n"+
+			"- **Thresholds**: soft=%.0f%% · hard=%.0f%%\n"+
+			"- **Docs Policy**: `%s`\n"+
+			"- **Max Epochs**: %s\n"+
+			"- **Max Cost**: %s",
 		status,
 		m.effectiveEpoch(),
 		m.rolloverState,
@@ -3102,20 +3212,89 @@ func (m *Model) startManualRollover(docsOverride *rollover.DocsPolicy, steeringH
 	if docsOverride != nil {
 		policy = *docsOverride
 	}
+	allowDocs := policy == rollover.DocsPolicyAlways
 
-	return m.startRollover(session.RolloverTriggerManual, policy, steeringHint)
+	return m.startRollover(session.RolloverTriggerManual, policy, allowDocs, steeringHint, "")
 }
 
-func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, steeringHint string) tea.Cmd {
+func (m *Model) knownContextWindow() int32 {
+	if m.contextWindow > 0 {
+		return m.contextWindow
+	}
+	if m.client != nil {
+		return bedrock.LookupModel(m.client.ModelID()).ContextWindow
+	}
+	return 0
+}
+
+func (m *Model) isOrchestratorActive() bool {
+	if m.morph == nil || m.agent == nil {
+		return true
+	}
+	active := m.agent.ActiveNode()
+	if active == "" {
+		return true
+	}
+	node, ok := m.morph.Nodes[active]
+	if !ok {
+		return true
+	}
+	return node.IsPrimary
+}
+
+func (m *Model) maybeAutoRollover(turnIdle bool) (tea.Cmd, bool) {
+	if m.rolloverCtrl == nil || !m.rolloverCfg.AutoRollover || m.rolloverState == rollover.StateCloseout {
+		return nil, false
+	}
+
+	lastCallTotal := m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
+	obs := rollover.Observation{
+		CurrentEpoch:      m.effectiveEpoch(),
+		EpochTurns:        m.turnCount(),
+		LastCallTokens:    lastCallTotal,
+		ContextWindow:     m.knownContextWindow(),
+		CumulativeCostUSD: m.estimateCost(),
+		IsOrchestrator:    m.isOrchestratorActive(),
+		PendingAsyncTasks: m.activeSwarmTasks,
+		TurnIdle:          turnIdle,
+		GreenMilestone:    m.rolloverGreenMilestone,
+	}
+
+	dec := m.rolloverCtrl.Evaluate(obs)
+	m.rolloverState = m.rolloverCtrl.State()
+
+	switch dec.Action {
+	case rollover.ActionArm:
+		m.rolloverArmedCtxPct = dec.ContextPct
+		m.updateViewportContent()
+		return nil, false
+	case rollover.ActionBudgetPaused:
+		m.appendSystemNotice(dec.Reason, false)
+		return nil, false
+	case rollover.ActionTriggerCloseout:
+		m.rolloverArmedCtxPct = 0
+		return m.startRollover(dec.Trigger, m.rolloverCfg.DocsPolicy, dec.AllowDocWrites, "", dec.Reason), true
+	default:
+		if m.rolloverState == rollover.StateNormal {
+			m.rolloverArmedCtxPct = 0
+		}
+		return nil, false
+	}
+}
+
+func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollover.DocsPolicy, allowDocWrites bool, steeringHint string, reason string) tea.Cmd {
 	prevEpoch := m.effectiveEpoch()
 	nextEpoch := prevEpoch + 1
 
 	m.rolloverPreHistory = append([]provider.Message(nil), m.history...)
 	m.rolloverTokensBefore = m.lastCallInputTokens + m.lastCallCacheReadInputTokens + m.lastCallCacheWriteInputTokens
 	m.rolloverState = rollover.StateCloseout
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.SetState(rollover.StateCloseout)
+	}
 	m.rolloverTrigger = trigger
 	m.rolloverDocsPolicy = docsPolicy
-	m.rolloverDocsAllowed = (docsPolicy == rollover.DocsPolicyAlways)
+	m.rolloverDocsAllowed = allowDocWrites
 	m.rolloverSteeringHint = steeringHint
 	m.rolloverCloseoutStep = 0
 	m.rolloverCloseoutMaxSteps = m.rolloverCfg.CloseoutMaxSteps
@@ -3126,9 +3305,13 @@ func (m *Model) startRollover(trigger session.RolloverTrigger, docsPolicy rollov
 		m.rolloverCloseoutMaxSteps = 8
 	}
 
+	banner := fmt.Sprintf("↻ Rolling over Epoch %d → Epoch %d (checkpointing via save_checkpoint… Esc twice to cancel)", prevEpoch, nextEpoch)
+	if reason != "" {
+		banner = fmt.Sprintf("↻ %s — Epoch %d → Epoch %d (checkpointing… Esc twice to cancel)", reason, prevEpoch, nextEpoch)
+	}
 	m.messages = append(m.messages, chatMessage{
 		role:    "system_nudge",
-		content: fmt.Sprintf("↻ Rolling over Epoch %d → Epoch %d (checkpointing via save_checkpoint… Esc twice to cancel)", prevEpoch, nextEpoch),
+		content: banner,
 	})
 
 	forced := trigger == session.RolloverTriggerHardThreshold
@@ -3145,9 +3328,13 @@ func (m *Model) abortRollover(notice string) {
 		m.rolloverPreHistory = nil
 	}
 	m.rolloverState = rollover.StateNormal
+	m.rolloverArmedCtxPct = 0
 	m.rolloverDocsAllowed = false
 	m.rolloverSteeringHint = ""
 	m.rolloverCloseoutStep = 0
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnCloseoutCancelled()
+	}
 	m.appendSystemNotice(notice, true)
 	m.saveSession()
 }
@@ -3247,12 +3434,18 @@ func (m *Model) commitEpochRollover(payload session.CheckpointPayload) tea.Cmd {
 	m.autoNudgeCount = 0
 	m.rolloverPreHistory = nil
 	m.rolloverDocsAllowed = false
+	m.rolloverArmedCtxPct = 0
+	m.rolloverGreenMilestone = false
 	steeringHint := m.rolloverSteeringHint
 	m.rolloverSteeringHint = ""
 	m.rolloverCloseoutStep = 0
 	m.rolloverState = rollover.StateNormal
+	if m.rolloverCtrl != nil {
+		m.rolloverCtrl.OnEpochCommitted()
+	}
 
 	bootstrapText := rollover.BuildBootstrapMessage(nextEpoch, prevEpoch, pinned, payload, steeringHint)
+	m.history = nil
 	m.history = []provider.Message{
 		m.stampMessage(provider.BuildUserTextMessage(bootstrapText)),
 	}
