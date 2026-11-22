@@ -36,7 +36,7 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 	sd := newStateDict(userMessage)
 	greenMilestone := false
 
-	for step := 0; step < a.maxSteps; step++ {
+	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
 		effectivePrompt := a.effectiveSystemPrompt()
 
 		// For smaller/local models, append the state dictionary to the system prompt.
@@ -229,7 +229,7 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 	sd := newStateDict(userMessage)
 	greenMilestone := false
 
-	for step := 0; step < a.maxSteps; step++ {
+	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
 		// For smaller/local models, append state dictionary to system prompt.
 		effectivePrompt := a.effectiveSystemPrompt()
 		if step >= 2 && a.needsGroundingAssist() {

@@ -89,7 +89,7 @@ type Config struct {
 	PluginMgr *pluginhost.Manager
 	WorkDir   string
 	PluginDir string // Plugin binary directory (for reload)
-	MaxSteps  int    // Maximum tool-use iterations per turn. Default: 25
+	MaxSteps  int    // Maximum tool-use iterations per turn (0 = unlimited)
 	Verbose   bool   // Print debug info
 
 	// Safety
@@ -112,8 +112,8 @@ type Config struct {
 
 // NewAgent creates a new conversation agent.
 func NewAgent(cfg Config) (*Agent, error) {
-	if cfg.MaxSteps == 0 {
-		cfg.MaxSteps = 25
+	if cfg.MaxSteps < 0 {
+		cfg.MaxSteps = 0
 	}
 
 	// Phase 2: Compute available Swarm Nodes for the prompt
@@ -317,7 +317,7 @@ func (a *Agent) Turn(ctx context.Context, userMessage string) (string, error) {
 	a.turn++
 	a.history = append(a.history, bedrock.BuildUserTextMessage(userMessage))
 
-	for step := 0; step < a.maxSteps; step++ {
+	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
 		// Compute effective system prompt (base + reconciler injection)
 		effectivePrompt := a.effectiveSystemPrompt()
 
@@ -459,7 +459,7 @@ func (a *Agent) StreamTurn(ctx context.Context, userMessage string, cb StreamCal
 	a.turn++
 	a.history = append(a.history, bedrock.BuildUserTextMessage(userMessage))
 
-	for step := 0; step < a.maxSteps; step++ {
+	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
 		var textBuf strings.Builder
 		var toolCalls []pendingToolCall
 		var currentToolInput strings.Builder

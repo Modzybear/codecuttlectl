@@ -3,6 +3,7 @@ package conversation
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -459,5 +460,81 @@ func TestNewAgentInitialNodeResolvesTargetProfile(t *testing.T) {
 	}
 	if !IsToolAllowed("read_file", a.Workbench()) || IsToolAllowed("todo_manage", a.Workbench()) {
 		t.Fatalf("unexpected worker workbench: %v", a.Workbench())
+	}
+}
+
+type multiStepProvider struct {
+	provider.Provider
+	toolSteps int
+	calls     int
+}
+
+func (p *multiStepProvider) ID() string   { return "test:multi" }
+func (p *multiStepProvider) Name() string { return "multi" }
+func (p *multiStepProvider) Converse(_ context.Context, _ provider.Request) (*provider.Response, error) {
+	p.calls++
+	if p.calls <= p.toolSteps {
+		return &provider.Response{
+			StopReason: "tool_use",
+			ToolUses: []provider.ToolUseRequest{
+				{
+					ToolUseID: fmt.Sprintf("tc_%d", p.calls),
+					Name:      "todo_manage",
+					Input:     json.RawMessage(`{"todos":[]}`),
+				},
+			},
+		}, nil
+	}
+	return &provider.Response{
+		StopReason: "end_turn",
+		Content:    "done after many steps",
+	}, nil
+}
+
+func (p *multiStepProvider) ConverseStream(ctx context.Context, req provider.Request) <-chan provider.StreamEvent {
+	ch := make(chan provider.StreamEvent, 6)
+	go func() {
+		defer close(ch)
+		resp, err := p.Converse(ctx, req)
+		if err != nil {
+			ch <- provider.StreamErrorEvent{Err: err}
+			return
+		}
+		if resp.Content != "" {
+			ch <- provider.TextDeltaEvent{Text: resp.Content}
+		}
+		for _, tu := range resp.ToolUses {
+			ch <- provider.ToolUseStartEvent{ToolUseID: tu.ToolUseID, Name: tu.Name}
+			ch <- provider.ToolInputDeltaEvent{Delta: string(tu.Input)}
+			ch <- provider.ToolUseStopEvent{}
+		}
+		ch <- provider.MessageStopEvent{StopReason: resp.StopReason}
+	}()
+	return ch
+}
+
+func TestMaxStepsZeroIsUnlimitedByDefault(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		prov := &multiStepProvider{toolSteps: 30}
+		agent, err := NewAgent(Config{
+			Provider: prov,
+			WorkDir:  t.TempDir(),
+			// MaxSteps omitted (0 = unlimited)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out string
+		if streaming {
+			out, err = agent.StreamTurn(context.Background(), "run 30 steps", nil)
+		} else {
+			out, err = agent.Turn(context.Background(), "run 30 steps")
+		}
+		if err != nil {
+			t.Fatalf("streaming=%v: expected unlimited MaxSteps=0 to succeed past 25 steps, got err: %v", streaming, err)
+		}
+		if out != "done after many steps" || prov.calls != 31 {
+			t.Fatalf("streaming=%v: unexpected output=%q calls=%d", streaming, out, prov.calls)
+		}
 	}
 }
