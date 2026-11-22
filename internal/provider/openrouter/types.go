@@ -87,12 +87,19 @@ type chatChoice struct {
 	NativeFinishReason string      `json:"native_finish_reason,omitempty"`
 }
 
+// promptTokensDetails reports cache hit and write counts inside chatUsage.
+type promptTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+}
+
 // chatUsage reports token consumption.
 type chatUsage struct {
-	PromptTokens     int      `json:"prompt_tokens"`
-	CompletionTokens int      `json:"completion_tokens"`
-	TotalTokens      int      `json:"total_tokens"`
-	Cost             *float64 `json:"cost,omitempty"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	Cost                *float64             `json:"cost,omitempty"`
+	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
 // --- Streaming types ---

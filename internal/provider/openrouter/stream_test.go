@@ -405,6 +405,41 @@ func TestStreamUsageCostPreserved(t *testing.T) {
 	}
 }
 
+func TestStreamUsagePromptTokensDetailsCached(t *testing.T) {
+	events := collectStream(t, sse(
+		`{"choices":[{"delta":{"content":"cached reply"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":10339,"completion_tokens":60,"cost":0.0042,"prompt_tokens_details":{"cached_tokens":10318,"cache_write_tokens":0}}}`,
+		`[DONE]`,
+	))
+
+	var gotUsage *provider.UsageEvent
+	for _, event := range events {
+		if u, ok := event.(provider.UsageEvent); ok {
+			gotUsage = &u
+		}
+	}
+	if gotUsage == nil {
+		t.Fatal("expected UsageEvent")
+	}
+	if gotUsage.InputTokens != 21 || gotUsage.CacheReadTokens != 10318 || gotUsage.CacheWriteTokens != 0 || gotUsage.OutputTokens != 60 || gotUsage.CostUSD != 0.0042 || gotUsage.InputTokensUnknown {
+		t.Fatalf("unexpected usage: %+v (want in=21, cacheRead=10318, cacheWrite=0, out=60, cost=0.0042, unknown=false)", gotUsage)
+	}
+}
+
+func TestStreamUsageNegativeCachedTokensRejected(t *testing.T) {
+	ch := make(chan provider.StreamEvent, 10)
+	err := parseSSEStream(context.Background(), strings.NewReader(sse(
+		`{"choices":[{"delta":{"content":"hi"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":-5}}}`,
+		`[DONE]`,
+	)), ch)
+	if err == nil || !strings.Contains(err.Error(), "negative cached token count") {
+		t.Fatalf("expected negative cached token error, got %v", err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

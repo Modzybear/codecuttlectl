@@ -20,12 +20,52 @@ const (
 	maxStreamTools   = 128
 )
 
+// streamPromptTokensDetails keeps cached token fields optional in SSE usage snapshots.
+type streamPromptTokensDetails struct {
+	CachedTokens     *int32 `json:"cached_tokens,omitempty"`
+	CacheWriteTokens *int32 `json:"cache_write_tokens,omitempty"`
+}
+
 // streamUsage keeps field presence distinct from an explicitly reported zero.
 // Usage chunks are cumulative snapshots, not increments.
 type streamUsage struct {
-	PromptTokens     *int32   `json:"prompt_tokens"`
-	CompletionTokens *int32   `json:"completion_tokens"`
-	Cost             *float64 `json:"cost,omitempty"`
+	PromptTokens        *int32                     `json:"prompt_tokens"`
+	CompletionTokens    *int32                     `json:"completion_tokens"`
+	Cost                *float64                   `json:"cost,omitempty"`
+	PromptTokensDetails *streamPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+func (u streamUsage) present() bool {
+	return u.PromptTokens != nil || u.CompletionTokens != nil || u.Cost != nil || u.PromptTokensDetails != nil
+}
+
+func (u streamUsage) toEvent(abnormal bool) provider.UsageEvent {
+	var totalPrompt, cached, cacheWrite int32
+	if u.PromptTokens != nil {
+		totalPrompt = *u.PromptTokens
+	}
+	if u.PromptTokensDetails != nil {
+		if u.PromptTokensDetails.CachedTokens != nil {
+			cached = *u.PromptTokensDetails.CachedTokens
+		}
+		if u.PromptTokensDetails.CacheWriteTokens != nil {
+			cacheWrite = *u.PromptTokensDetails.CacheWriteTokens
+		}
+	}
+	inTok, cacheReadTok, cacheWriteTok := normalizePromptTokens(totalPrompt, cached, cacheWrite)
+	event := provider.UsageEvent{
+		InputTokens:        inTok,
+		CacheReadTokens:    cacheReadTok,
+		CacheWriteTokens:   cacheWriteTok,
+		InputTokensUnknown: u.PromptTokens == nil || (abnormal && *u.PromptTokens == 0),
+	}
+	if u.CompletionTokens != nil {
+		event.OutputTokens = *u.CompletionTokens
+	}
+	if u.Cost != nil {
+		event.CostUSD = *u.Cost
+	}
+	return event
 }
 
 func sendStreamEvent(ctx context.Context, events chan<- provider.StreamEvent, event provider.StreamEvent) error {
@@ -108,6 +148,26 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 			if c := chunk.Usage.Cost; c != nil {
 				if !math.IsNaN(*c) && !math.IsInf(*c, 0) && *c >= 0 {
 					usage.Cost = c
+				}
+			}
+			if d := chunk.Usage.PromptTokensDetails; d != nil {
+				if d.CachedTokens != nil {
+					if *d.CachedTokens < 0 {
+						return fmt.Errorf("openrouter: negative cached token count")
+					}
+					if usage.PromptTokensDetails == nil {
+						usage.PromptTokensDetails = &streamPromptTokensDetails{}
+					}
+					usage.PromptTokensDetails.CachedTokens = d.CachedTokens
+				}
+				if d.CacheWriteTokens != nil {
+					if *d.CacheWriteTokens < 0 {
+						return fmt.Errorf("openrouter: negative cache write token count")
+					}
+					if usage.PromptTokensDetails == nil {
+						usage.PromptTokensDetails = &streamPromptTokensDetails{}
+					}
+					usage.PromptTokensDetails.CacheWriteTokens = d.CacheWriteTokens
 				}
 			}
 		}
@@ -237,20 +297,8 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 		return fmt.Errorf("openrouter: stream ended before finish reason: %w", io.ErrUnexpectedEOF)
 	}
 	if err, abnormal := classifyAbnormalFinish(finishReason, nativeFinishReason, emittedVisible); abnormal {
-		if usage.PromptTokens != nil || usage.CompletionTokens != nil || usage.Cost != nil {
-			event := provider.UsageEvent{
-				InputTokensUnknown: usage.PromptTokens == nil || *usage.PromptTokens == 0,
-			}
-			if usage.PromptTokens != nil {
-				event.InputTokens = *usage.PromptTokens
-			}
-			if usage.CompletionTokens != nil {
-				event.OutputTokens = *usage.CompletionTokens
-			}
-			if usage.Cost != nil {
-				event.CostUSD = *usage.Cost
-			}
-			_ = emit(event)
+		if usage.present() {
+			_ = emit(usage.toEvent(true))
 		}
 		return err
 	}
@@ -301,18 +349,8 @@ func parseSSEStream(ctx context.Context, body io.Reader, events chan<- provider.
 	if err := emit(provider.MessageStopEvent{StopReason: finishReason}); err != nil {
 		return err
 	}
-	if usage.PromptTokens != nil || usage.CompletionTokens != nil || usage.Cost != nil {
-		event := provider.UsageEvent{InputTokensUnknown: usage.PromptTokens == nil}
-		if usage.PromptTokens != nil {
-			event.InputTokens = *usage.PromptTokens
-		}
-		if usage.CompletionTokens != nil {
-			event.OutputTokens = *usage.CompletionTokens
-		}
-		if usage.Cost != nil {
-			event.CostUSD = *usage.Cost
-		}
-		return emit(event)
+	if usage.present() {
+		return emit(usage.toEvent(false))
 	}
 	return nil
 }

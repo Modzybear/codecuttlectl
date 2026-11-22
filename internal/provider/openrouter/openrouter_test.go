@@ -383,3 +383,35 @@ func TestCompletionToResponse_CopiesReasoningDetailsAndCost(t *testing.T) {
 		t.Errorf("CostUSD = %v, want 0.0042", resp.Usage.CostUSD)
 	}
 }
+
+func TestCompletionToResponse_NormalizesCachedPromptTokens(t *testing.T) {
+	resp := completionToResponse(chatCompletion{
+		Choices: []chatChoice{
+			{
+				FinishReason: "stop",
+				Message:      chatMessage{Role: "assistant", Content: "ok"},
+			},
+		},
+		Usage: &chatUsage{
+			PromptTokens:     10339,
+			CompletionTokens: 60,
+			TotalTokens:      10399,
+			PromptTokensDetails: &promptTokensDetails{
+				CachedTokens:     10000,
+				CacheWriteTokens: 100,
+			},
+		},
+	})
+	if resp.Usage.InputTokens != 239 || resp.Usage.CacheReadTokens != 10000 || resp.Usage.CacheWriteTokens != 100 {
+		t.Fatalf("unexpected normalized usage: %+v (want in=239, cacheRead=10000, cacheWrite=100)", resp.Usage)
+	}
+	if total := resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens; total != 10339 {
+		t.Fatalf("disjoint sum = %d, want 10339", total)
+	}
+
+	// Overflow guard: cached + write > prompt_tokens clamps InputTokens to 0
+	in, cr, cw := normalizePromptTokens(100, 120, 10)
+	if in != 0 || cr != 120 || cw != 10 {
+		t.Fatalf("overflow clamp = (%d, %d, %d), want (0, 120, 10)", in, cr, cw)
+	}
+}
