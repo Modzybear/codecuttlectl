@@ -28,4 +28,14 @@ type Store interface {
 	// Prune removes sessions older than maxAge (based on updated_at).
 	// Returns the number of sessions deleted.
 	Prune(maxAge time.Duration) (int, error)
+
+	// SaveEpochArchive atomically persists an immutable closed epoch archive
+	// and returns its relative archive path (e.g. "epochs/ses_abc12345/epoch-001.json").
+	SaveEpochArchive(id string, archive *EpochArchive) (string, error)
+
+	// LoadEpochArchive retrieves a specific closed epoch archive by session ID and epoch number.
+	LoadEpochArchive(id string, epoch int) (*EpochArchive, error)
+
+	// ListEpochArchives returns the sorted epoch numbers archived for a session.
+	ListEpochArchives(id string) ([]int, error)
 }
