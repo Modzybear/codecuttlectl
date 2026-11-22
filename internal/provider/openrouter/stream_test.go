@@ -284,6 +284,105 @@ func TestStreamCancelWithFullEventQueue(t *testing.T) {
 	}
 }
 
+func TestStreamReasoningDetailsAccumulationAndParallelEncrypted(t *testing.T) {
+	events := collectStream(t, sse(
+		`{"choices":[{"delta":{"reasoning":"step 1 ","reasoning_details":[{"type":"reasoning.text","index":0,"format":"google-gemini-v1","text":"step 1 "}]}}]}`,
+		`{"choices":[{"delta":{"reasoning":"step 2","reasoning_details":[{"type":"reasoning.text","index":0,"format":"google-gemini-v1","text":"step 2","signature":"sig_txt"}]}}]}`,
+		`{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_a","index":0,"format":"google-gemini-v1","data":"enc_a"}],"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}}]}}]}`,
+		`{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_b","index":0,"format":"google-gemini-v1","data":"enc_b"}],"tool_calls":[{"index":1,"id":"call_b","function":{"name":"grep","arguments":"{\"pattern\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	))
+
+	var reasoningText strings.Builder
+	var sigEvents []provider.ReasoningSignatureEvent
+	var sigIdx, firstToolIdx, msgStopIdx = -1, -1, -1
+
+	for i, ev := range events {
+		switch e := ev.(type) {
+		case provider.ReasoningDeltaEvent:
+			reasoningText.WriteString(e.Text)
+		case provider.ReasoningSignatureEvent:
+			sigEvents = append(sigEvents, e)
+			if sigIdx == -1 {
+				sigIdx = i
+			}
+		case provider.ToolUseStartEvent:
+			if firstToolIdx == -1 {
+				firstToolIdx = i
+			}
+		case provider.MessageStopEvent:
+			msgStopIdx = i
+		case provider.StreamErrorEvent:
+			t.Fatalf("unexpected error: %v", e.Err)
+		}
+	}
+
+	// Plaintext reasoning must not be double-emitted from reasoning_details.
+	if reasoningText.String() != "step 1 step 2" {
+		t.Fatalf("reasoning text=%q, want %q", reasoningText.String(), "step 1 step 2")
+	}
+	if len(sigEvents) != 1 {
+		t.Fatalf("expected 1 ReasoningSignatureEvent, got %d", len(sigEvents))
+	}
+	if sigIdx == -1 || firstToolIdx == -1 || msgStopIdx == -1 || !(sigIdx < firstToolIdx && firstToolIdx < msgStopIdx) {
+		t.Fatalf("unexpected event order: sig=%d tool=%d stop=%d", sigIdx, firstToolIdx, msgStopIdx)
+	}
+	details := sigEvents[0].Details
+	if len(details) != 3 {
+		t.Fatalf("expected 3 details (1 merged text + 2 distinct parallel encrypted), got %+v", details)
+	}
+	if details[0].Type != "reasoning.text" || details[0].Text != "step 1 step 2" || details[0].Signature != "sig_txt" {
+		t.Errorf("unexpected merged reasoning.text: %+v", details[0])
+	}
+	if details[1].Type != "reasoning.encrypted" || details[1].ID != "call_a" || details[1].Data != "enc_a" {
+		t.Errorf("unexpected first encrypted detail: %+v", details[1])
+	}
+	if details[2].Type != "reasoning.encrypted" || details[2].ID != "call_b" || details[2].Data != "enc_b" {
+		t.Errorf("unexpected second encrypted detail: %+v", details[2])
+	}
+}
+
+func TestStreamEncryptedOnlyReasoningStillRetriesMalformed(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			fmt.Fprint(w, sse(
+				`{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_bad","index":0,"format":"google-gemini-v1","data":"enc_bad"}]},"finish_reason":"stop","native_finish_reason":"MALFORMED_RESPONSE"}]}`,
+				`[DONE]`,
+			))
+			return
+		}
+		fmt.Fprint(w, sse(
+			`{"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		))
+	}))
+	defer server.Close()
+
+	c := New(Config{BaseURL: server.URL})
+	c.waitRetry = func(context.Context, time.Duration) error { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var text strings.Builder
+	var retries int
+	for ev := range c.ConverseStream(ctx, provider.Request{}) {
+		switch e := ev.(type) {
+		case provider.RetryEvent:
+			retries++
+		case provider.TextDeltaEvent:
+			text.WriteString(e.Text)
+		case provider.StreamErrorEvent:
+			t.Fatalf("unexpected error after retry: %v", e.Err)
+		}
+	}
+	if attempts != 2 || retries != 1 || text.String() != "recovered" {
+		t.Fatalf("attempts=%d retries=%d text=%q; want 2, 1, recovered", attempts, retries, text.String())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

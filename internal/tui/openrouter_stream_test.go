@@ -12,6 +12,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
 	"github.com/Modzybear/codecuttlectl/internal/provider/openrouter"
+	"github.com/Modzybear/codecuttlectl/internal/session"
 )
 
 func TestOpenRouterReasoningToolsAndLateUsageReachTUI(t *testing.T) {
@@ -118,4 +119,145 @@ func TestOpenRouterPrematureEOFSurfacesInTUI(t *testing.T) {
 		}
 	}
 	t.Fatal("no terminal error")
+}
+
+func TestOpenRouterEncryptedReasoningDetailsPersistThroughTUIAndSessionRestore(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, payload := range []string{
+			`{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_1","index":0,"format":"google-gemini-v1","data":"enc_sig_1"}],"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+		}
+	}))
+	defer server.Close()
+
+	store, err := session.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	sessID, err := store.Create(session.SessionMeta{Model: "openrouter:google/gemini-4-neon"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	prov := openrouter.New(openrouter.Config{BaseURL: server.URL, Model: "google/gemini-4-neon"})
+	m := New(Config{
+		PluginMgr: pluginhost.NewManager(false),
+		Provider:  prov,
+		Store:     store,
+		SessionID: sessID,
+	})
+	m.history = []provider.Message{provider.BuildUserTextMessage("read a.go")}
+	m.streaming = true
+	m.streamCh = prov.ConverseStream(ctx, provider.Request{})
+
+	for steps := 0; steps < 20; steps++ {
+		msg := m.readNextStreamEvent()()
+		updated, _ := m.Update(msg)
+		m = updated.(Model)
+		if errMsg, ok := msg.(StreamErrorMsg); ok {
+			t.Fatal(errMsg.Err)
+		}
+		if _, ok := msg.(StreamDoneMsg); ok {
+			break
+		}
+	}
+
+	if len(m.history) != 2 {
+		t.Fatalf("expected 2 history messages, got %d", len(m.history))
+	}
+	rb, ok := m.history[1].Content[0].(provider.ReasoningBlock)
+	if !ok {
+		t.Fatalf("expected ReasoningBlock at history[1].Content[0], got %T", m.history[1].Content[0])
+	}
+	if len(rb.ReasoningDetails) != 1 || rb.ReasoningDetails[0].Data != "enc_sig_1" || rb.ReasoningDetails[0].ID != "call_1" {
+		t.Fatalf("unexpected ReasoningDetails in TUI history: %+v", rb.ReasoningDetails)
+	}
+
+	// Save and restore via New() -> restoreSession() and verify lossless round-trip.
+	m.saveSession()
+	restored := New(Config{
+		PluginMgr: pluginhost.NewManager(false),
+		Provider:  prov,
+		Store:     store,
+		SessionID: sessID,
+	})
+	if len(restored.history) != 2 {
+		t.Fatalf("expected 2 restored messages, got %d", len(restored.history))
+	}
+	restoredRB, ok := restored.history[1].Content[0].(provider.ReasoningBlock)
+	if !ok {
+		t.Fatalf("expected ReasoningBlock after restoreSession, got %T", restored.history[1].Content[0])
+	}
+	if len(restoredRB.ReasoningDetails) != 1 || restoredRB.ReasoningDetails[0].Data != "enc_sig_1" || restoredRB.ReasoningDetails[0].ID != "call_1" {
+		t.Fatalf("ReasoningDetails lost across restoreSession: %+v", restoredRB.ReasoningDetails)
+	}
+}
+
+func TestNeedsGroundingAssistAndBatchedCompaction(t *testing.T) {
+	// Cloud provider with unknown (0) context window should NOT enable small-model grounding.
+	orProv := openrouter.New(openrouter.Config{Model: "google/gemini-4-neon"})
+	m := New(Config{PluginMgr: pluginhost.NewManager(false)})
+	m.llmProvider = orProv
+	m.contextWindow = 0
+	if m.needsGroundingAssist() {
+		t.Error("expected openrouter provider with unknown context window (0) not to trigger needsGroundingAssist")
+	}
+
+	// Provider explicitly reporting small context window (128k) SHOULD enable grounding.
+	m.contextWindow = 131_072
+	if !m.needsGroundingAssist() {
+		t.Error("expected provider with 131k context window to trigger needsGroundingAssist")
+	}
+
+	// Large context window (1M) should NOT enable grounding.
+	m.contextWindow = 1_048_576
+	if m.needsGroundingAssist() {
+		t.Error("expected 1M context window not to trigger needsGroundingAssist")
+	}
+
+	// Verify batched mid-turn compaction on large model: 15 rounds (3 stale < MinCompactBatch=6)
+	// stays untouched mid-turn (streamStep > 0) to preserve prefix cache, while 18 rounds (6 stale)
+	// compacts in a single batch.
+	var lines []string
+	for i := 0; i < 60; i++ {
+		lines = append(lines, fmt.Sprintf("line %02d: payload content for cache-preserving batch compaction", i))
+	}
+	bigContent := strings.Join(lines, "\n")
+	buildRounds := func(n int) []provider.Message {
+		msgs := []provider.Message{provider.BuildUserTextMessage("long task")}
+		for i := 1; i <= n; i++ {
+			id := fmt.Sprintf("c_%d", i)
+			msgs = append(msgs,
+				provider.BuildAssistantMessage([]provider.ContentBlock{
+					provider.ToolUseBlock{ToolUseID: id, Name: "read_file", Input: []byte(`{}`)},
+				}),
+				provider.BuildToolResultMessage([]provider.ToolResultBlock{
+					{ToolUseID: id, Name: "read_file", Content: bigContent},
+				}),
+			)
+		}
+		return msgs
+	}
+
+	m.history = buildRounds(15)
+	m.streamStep = 5
+	m.maybeCompact()
+	tr1 := m.history[2].Content[0].(provider.ToolResultBlock)
+	if tr1.Content != bigContent {
+		t.Error("expected mid-turn compaction with only 3 stale rounds (< batch 6) to be deferred")
+	}
+
+	m.history = buildRounds(18)
+	m.streamStep = 5
+	m.maybeCompact()
+	tr1 = m.history[2].Content[0].(provider.ToolResultBlock)
+	if len(tr1.Content) >= len(bigContent) {
+		t.Error("expected mid-turn compaction to fire once 6 stale rounds accumulate")
+	}
 }

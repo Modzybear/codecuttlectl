@@ -763,7 +763,7 @@ func (a *Agent) handleHandoff(input json.RawMessage) (string, types.ToolResultSt
 	var sanitized []provider.Message
 	if len(a.provHistory) > 0 {
 		// Sanitize a copy so the source history survives a later failure.
-		sanitized = provider.SanitizeHistoryForProvider(append([]provider.Message(nil), a.provHistory...), profile.Provider.ID())
+		sanitized = provider.SanitizeHistoryForProvider(append([]provider.Message(nil), a.provHistory...), provider.EffectiveID(profile.Provider))
 	}
 
 	source := a.activeNode

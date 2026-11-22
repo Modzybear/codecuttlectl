@@ -88,3 +88,91 @@ func TestSanitizeHistoryForProvider(t *testing.T) {
 		t.Errorf("expected Gemini thought signature preserved for Google target, got: %q", googleTUB.ThoughtSignature)
 	}
 }
+
+func TestSanitizeHistoryForProvider_ReasoningDetails(t *testing.T) {
+	idx0 := 0
+	msgs := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentBlock{
+				ReasoningBlock{
+					ReasoningDetails: []ReasoningDetail{
+						{Type: "reasoning.encrypted", ID: "call_1", Format: "google-gemini-v1", Index: &idx0, Data: "enc_g1"},
+						{Type: "reasoning.encrypted", ID: "call_missing", Format: "google-gemini-v1", Index: &idx0, Data: "enc_orphan"},
+						{Type: "reasoning.encrypted", ID: "call_1", Format: "anthropic-claude-v1", Index: &idx0, Data: "enc_a1"},
+						{Type: "reasoning.text", Format: "google-gemini-v1", Index: &idx0, Text: "thought"},
+					},
+				},
+				ToolUseBlock{ToolUseID: "call_1", Name: "read_file", Input: []byte(`{"path":"a.go"}`)},
+			},
+		},
+		{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				ToolResultBlock{ToolUseID: "call_1", Name: "read_file", Content: "ok"},
+			},
+		},
+	}
+
+	// 1. OpenRouter Google target: keeps google-gemini-v1 details with matching tool_use ID (and reasoning.text), drops orphan and anthropic details.
+	googleOR := SanitizeHistoryForProvider(msgs, "openrouter:google/gemini-4-neon")
+	if len(googleOR) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(googleOR))
+	}
+	rb, ok := googleOR[0].Content[0].(ReasoningBlock)
+	if !ok {
+		t.Fatalf("expected ReasoningBlock preserved for openrouter:google, got %T", googleOR[0].Content[0])
+	}
+	if len(rb.ReasoningDetails) != 2 {
+		t.Fatalf("expected 2 compatible google reasoning details, got %+v", rb.ReasoningDetails)
+	}
+	if rb.ReasoningDetails[0].ID != "call_1" || rb.ReasoningDetails[0].Data != "enc_g1" {
+		t.Errorf("unexpected first detail: %+v", rb.ReasoningDetails[0])
+	}
+	if rb.ReasoningDetails[1].Type != "reasoning.text" {
+		t.Errorf("unexpected second detail: %+v", rb.ReasoningDetails[1])
+	}
+
+	// 2. OpenRouter Anthropic target: keeps only anthropic-claude-v1 detail.
+	anthOR := SanitizeHistoryForProvider(msgs, "openrouter:anthropic/claude-opus-4-6")
+	rbAnth := anthOR[0].Content[0].(ReasoningBlock)
+	if len(rbAnth.ReasoningDetails) != 1 || rbAnth.ReasoningDetails[0].Format != "anthropic-claude-v1" {
+		t.Fatalf("expected only anthropic reasoning detail, got %+v", rbAnth.ReasoningDetails)
+	}
+
+	// 3. OpenRouter OpenAI target: drops all incompatible details AND drops empty ReasoningBlock.
+	openaiOR := SanitizeHistoryForProvider(msgs, "openrouter:openai/gpt-5")
+	if len(openaiOR[0].Content) != 1 {
+		t.Fatalf("expected empty ReasoningBlock to be dropped, got %+v", openaiOR[0].Content)
+	}
+	if _, ok := openaiOR[0].Content[0].(ToolUseBlock); !ok {
+		t.Fatalf("expected only ToolUseBlock remaining, got %T", openaiOR[0].Content[0])
+	}
+
+	// 4. Non-OpenRouter target (Bedrock): strips ReasoningDetails and drops empty ReasoningBlock.
+	bedrockRes := SanitizeHistoryForProvider(msgs, "bedrock:us.anthropic.claude-opus-4-6-v1")
+	if len(bedrockRes[0].Content) != 1 {
+		t.Fatalf("expected ReasoningDetails stripped and empty ReasoningBlock dropped for Bedrock, got %+v", bedrockRes[0].Content)
+	}
+}
+
+func TestEffectiveID(t *testing.T) {
+	if got := EffectiveID(nil); got != "" {
+		t.Fatalf("EffectiveID(nil) = %q, want empty", got)
+	}
+	p1 := &fakeProvider{id: "openrouter:google/gemini-4-neon"}
+	p2 := &fakeProvider{id: "openrouter:google/gemini-4-argon"}
+	if got := EffectiveID(p1); got != "openrouter:google/gemini-4-neon" {
+		t.Fatalf("EffectiveID(direct) = %q", got)
+	}
+	fp := NewFallbackProvider("orchestrator", p1, p2)
+	if got := EffectiveID(fp); got != "openrouter:google/gemini-4-neon" {
+		t.Fatalf("EffectiveID(fallback) = %q, want primary active ID", got)
+	}
+	// When all candidates are cooling down, ActiveID() is empty and EffectiveID falls back to logical ID.
+	fp.markCooldown(p1.ID(), nowFunc())
+	fp.markCooldown(p2.ID(), nowFunc())
+	if got := EffectiveID(fp); got != "orchestrator" {
+		t.Fatalf("EffectiveID(all cooling) = %q, want logical ID", got)
+	}
+}

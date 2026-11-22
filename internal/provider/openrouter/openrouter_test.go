@@ -257,3 +257,119 @@ func TestProviderMsgToOAI_ReasoningWithTextAndTools(t *testing.T) {
 		t.Errorf("tool calls not preserved: %+v", out[0].ToolCalls)
 	}
 }
+
+func TestProviderMsgToOAI_EchoesReasoningDetails(t *testing.T) {
+	idx0 := 0
+	msg := provider.Message{
+		Role: provider.RoleAssistant,
+		Content: []provider.ContentBlock{
+			provider.ReasoningBlock{
+				ReasoningDetails: []provider.ReasoningDetail{
+					{Type: "reasoning.encrypted", ID: "call_1", Format: "google-gemini-v1", Index: &idx0, Data: "enc_payload"},
+				},
+			},
+			provider.ToolUseBlock{
+				ToolUseID: "call_1",
+				Name:      "read_file",
+				Input:     []byte(`{"path":"a.go"}`),
+			},
+		},
+	}
+
+	out := providerMsgToOAI(msg)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(out))
+	}
+	if len(out[0].ReasoningDetails) != 1 || out[0].ReasoningDetails[0].Data != "enc_payload" || out[0].ReasoningDetails[0].ID != "call_1" {
+		t.Fatalf("reasoning_details not echoed: %+v", out[0].ReasoningDetails)
+	}
+	if len(out[0].ToolCalls) != 1 || out[0].ToolCalls[0].ID != "call_1" {
+		t.Fatalf("tool calls missing: %+v", out[0].ToolCalls)
+	}
+}
+
+func TestProviderMsgToOAI_ToolResultsBeforeUserText(t *testing.T) {
+	msg := provider.Message{
+		Role: provider.RoleUser,
+		Content: []provider.ContentBlock{
+			provider.TextBlock{Text: "follow-up note"},
+			provider.ToolResultBlock{ToolUseID: "call_1", Name: "read_file", Content: "file body"},
+		},
+	}
+
+	out := providerMsgToOAI(msg)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages, got %d: %+v", len(out), out)
+	}
+	if out[0].Role != "tool" || out[0].ToolCallID != "call_1" {
+		t.Fatalf("expected tool result first, got %+v", out[0])
+	}
+	if out[1].Role != "user" || out[1].Content != "follow-up note" {
+		t.Fatalf("expected user text second, got %+v", out[1])
+	}
+}
+
+func TestBuildRequest_CoalescesConsecutiveUserMessages(t *testing.T) {
+	c := New(Config{Model: "google/gemini-4-neon"})
+	raw := c.buildRequest(provider.Request{
+		System: "sys",
+		Messages: []provider.Message{
+			provider.BuildUserTextMessage("first user msg"),
+			provider.BuildUserTextMessage("second user msg"),
+			provider.BuildAssistantMessage([]provider.ContentBlock{
+				provider.ToolUseBlock{ToolUseID: "call_1", Name: "read_file", Input: []byte(`{}`)},
+			}),
+			provider.BuildToolResultMessage([]provider.ToolResultBlock{
+				{ToolUseID: "call_1", Name: "read_file", Content: "ok"},
+			}),
+			provider.BuildUserTextMessage("nudge 1"),
+			provider.BuildUserTextMessage("nudge 2"),
+		},
+	}, false)
+
+	var req chatRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	// Expected roles: system, user (coalesced), assistant, tool, user (coalesced)
+	wantRoles := []string{"system", "user", "assistant", "tool", "user"}
+	if len(req.Messages) != len(wantRoles) {
+		t.Fatalf("got %d messages (%+v), want %d", len(req.Messages), req.Messages, len(wantRoles))
+	}
+	for i, want := range wantRoles {
+		if req.Messages[i].Role != want {
+			t.Errorf("msg[%d].Role = %q, want %q", i, req.Messages[i].Role, want)
+		}
+	}
+	if req.Messages[1].Content != "first user msg\n\nsecond user msg" {
+		t.Errorf("coalesced user[1] = %q", req.Messages[1].Content)
+	}
+	if req.Messages[4].Content != "nudge 1\n\nnudge 2" {
+		t.Errorf("coalesced user[4] = %q", req.Messages[4].Content)
+	}
+}
+
+func TestCompletionToResponse_CopiesReasoningAndDetails(t *testing.T) {
+	idx0 := 0
+	resp := completionToResponse(chatCompletion{
+		Choices: []chatChoice{
+			{
+				FinishReason: "stop",
+				Message: chatMessage{
+					Role:      "assistant",
+					Content:   "done",
+					Reasoning: "thought",
+					ReasoningDetails: []provider.ReasoningDetail{
+						{Type: "reasoning.encrypted", ID: "c1", Format: "google-gemini-v1", Index: &idx0, Data: "enc"},
+					},
+				},
+			},
+		},
+	})
+	if resp.Reasoning != "thought" {
+		t.Errorf("Reasoning = %q, want thought", resp.Reasoning)
+	}
+	if len(resp.ReasoningDetails) != 1 || resp.ReasoningDetails[0].Data != "enc" {
+		t.Errorf("ReasoningDetails = %+v, want 1 item", resp.ReasoningDetails)
+	}
+}

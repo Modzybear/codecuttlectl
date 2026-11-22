@@ -34,6 +34,14 @@ func (p *Provider) Client() *bedrock.Client {
 	return p.client
 }
 
+// ContextWindow returns the model's context window size in tokens.
+func (p *Provider) ContextWindow() int32 {
+	if p == nil || p.client == nil {
+		return 0
+	}
+	return bedrock.LookupModel(p.client.ModelID()).ContextWindow
+}
+
 // Converse sends messages and returns a complete response.
 func (p *Provider) Converse(ctx context.Context, req provider.Request) (*provider.Response, error) {
 	// Convert provider types to Bedrock types

@@ -66,10 +66,25 @@ type TextBlock struct {
 
 func (TextBlock) contentBlock() {}
 
+// ReasoningDetail represents a structured reasoning item returned by OpenRouter
+// (e.g. encrypted Gemini thought signatures, reasoning.text, reasoning.summary)
+// that must be preserved and echoed back in assistant messages.
+type ReasoningDetail struct {
+	Type      string `json:"type"`
+	ID        string `json:"id,omitempty"`
+	Format    string `json:"format,omitempty"`
+	Index     *int   `json:"index,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Summary   string `json:"summary,omitempty"`
+	Data      string `json:"data,omitempty"`
+}
+
 // ReasoningBlock represents thinking/reasoning content from the model.
 type ReasoningBlock struct {
-	Text      string
-	Signature string
+	Text             string
+	Signature        string
+	ReasoningDetails []ReasoningDetail
 }
 
 func (ReasoningBlock) contentBlock() {}
@@ -106,10 +121,12 @@ type ToolDefinition struct {
 
 // Response holds the result of a complete (non-streaming) call.
 type Response struct {
-	Content    string
-	ToolUses   []ToolUseRequest
-	StopReason string
-	Usage      Usage
+	Content          string
+	Reasoning        string
+	ReasoningDetails []ReasoningDetail
+	ToolUses         []ToolUseRequest
+	StopReason       string
+	Usage            Usage
 }
 
 // ToolUseRequest represents the model requesting to use a tool.
@@ -149,9 +166,11 @@ type ReasoningDeltaEvent struct {
 
 func (ReasoningDeltaEvent) streamEvent() {}
 
-// ReasoningSignatureEvent carries the verification signature for multi-turn reasoning continuity.
+// ReasoningSignatureEvent carries the verification signature or structured
+// reasoning_details for multi-turn reasoning continuity.
 type ReasoningSignatureEvent struct {
 	Signature string
+	Details   []ReasoningDetail
 }
 
 func (ReasoningSignatureEvent) streamEvent() {}
@@ -227,6 +246,21 @@ type ContextWindowProvider interface {
 // to estimate the dollar cost of the session based on token usage.
 type CostEstimator interface {
 	EstimateCost(usage Usage) float64
+}
+
+// EffectiveID returns the active underlying provider ID for a Provider.
+// If p is a *FallbackProvider with a non-empty ActiveID(), it returns ActiveID();
+// otherwise it falls back to p.ID() (or "" if p is nil).
+func EffectiveID(p Provider) string {
+	if p == nil {
+		return ""
+	}
+	if fp, ok := p.(*FallbackProvider); ok {
+		if active := fp.ActiveID(); active != "" {
+			return active
+		}
+	}
+	return p.ID()
 }
 
 // Helper functions for building messages

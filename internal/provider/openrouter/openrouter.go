@@ -278,7 +278,21 @@ func (c *Client) buildRequest(req provider.Request, stream bool) []byte {
 	}
 
 	for _, msg := range req.Messages {
-		oaiReq.Messages = append(oaiReq.Messages, providerMsgToOAI(msg)...)
+		for _, oaiMsg := range providerMsgToOAI(msg) {
+			// Coalesce consecutive plain role:"user" messages to satisfy strict
+			// upstream role alternation (e.g. Google Gemini via OpenRouter).
+			if oaiMsg.Role == "user" && len(oaiReq.Messages) > 0 && oaiReq.Messages[len(oaiReq.Messages)-1].Role == "user" {
+				prev := &oaiReq.Messages[len(oaiReq.Messages)-1]
+				switch {
+				case prev.Content != "" && oaiMsg.Content != "":
+					prev.Content += "\n\n" + oaiMsg.Content
+				case oaiMsg.Content != "":
+					prev.Content = oaiMsg.Content
+				}
+				continue
+			}
+			oaiReq.Messages = append(oaiReq.Messages, oaiMsg)
+		}
 	}
 
 	// Build tools
@@ -367,6 +381,7 @@ func providerMsgToOAI(msg provider.Message) []chatMessage {
 		}
 
 		var result []chatMessage
+		result = append(result, toolResults...)
 		if len(textParts) > 0 {
 			combined := ""
 			for i, p := range textParts {
@@ -380,7 +395,6 @@ func providerMsgToOAI(msg provider.Message) []chatMessage {
 				Content: combined,
 			})
 		}
-		result = append(result, toolResults...)
 		return result
 
 	case provider.RoleAssistant:
@@ -395,7 +409,12 @@ func providerMsgToOAI(msg provider.Message) []chatMessage {
 			case provider.TextBlock:
 				textParts = append(textParts, b.Text)
 			case provider.ReasoningBlock:
-				reasoningParts = append(reasoningParts, b.Text)
+				if b.Text != "" {
+					reasoningParts = append(reasoningParts, b.Text)
+				}
+				if len(b.ReasoningDetails) > 0 {
+					m.ReasoningDetails = append(m.ReasoningDetails, b.ReasoningDetails...)
+				}
 			case provider.ToolUseBlock:
 				m.ToolCalls = append(m.ToolCalls, oaiToolCall{
 					ID:   b.ToolUseID,
@@ -423,7 +442,7 @@ func providerMsgToOAI(msg provider.Message) []chatMessage {
 		// rejected by some upstream providers (e.g. Google returns
 		// INVALID_ARGUMENT). If the message consisted only of reasoning,
 		// downgrade the reasoning to plain text; otherwise drop it.
-		if m.Content == "" && len(m.ToolCalls) == 0 {
+		if m.Content == "" && len(m.ToolCalls) == 0 && len(m.ReasoningDetails) == 0 {
 			if len(reasoningParts) == 0 {
 				return nil
 			}
@@ -444,6 +463,10 @@ func completionToResponse(c chatCompletion) *provider.Response {
 	if len(c.Choices) > 0 {
 		choice := c.Choices[0]
 		resp.Content = choice.Message.Content
+		resp.Reasoning = choice.Message.Reasoning
+		if len(choice.Message.ReasoningDetails) > 0 {
+			resp.ReasoningDetails = append([]provider.ReasoningDetail(nil), choice.Message.ReasoningDetails...)
+		}
 		resp.StopReason = string(choice.FinishReason)
 
 		for _, tc := range choice.Message.ToolCalls {

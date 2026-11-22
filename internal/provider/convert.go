@@ -127,11 +127,23 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 
 	isBedrockTarget := strings.HasPrefix(targetProvider, "bedrock")
 	isGoogleTarget := strings.HasPrefix(targetProvider, "google")
+	isOpenRouterTarget := strings.HasPrefix(targetProvider, "openrouter:")
 
 	knownToolCalls := make(map[string]bool)
 	var sanitized []Message
 
 	for _, msg := range msgs {
+		// Pre-scan tool_use IDs present in this message so reasoning.encrypted
+		// items with a non-empty ID can be validated against the same turn's tool calls.
+		msgToolUseIDs := make(map[string]bool)
+		if msg.Role == RoleAssistant {
+			for _, b := range msg.Content {
+				if tub, ok := b.(ToolUseBlock); ok && tub.ToolUseID != "" && tub.Name != "" {
+					msgToolUseIDs[tub.ToolUseID] = true
+				}
+			}
+		}
+
 		var cleanBlocks []ContentBlock
 		var textBlocks []string
 		var reasoningText []string
@@ -144,15 +156,36 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 					textBlocks = append(textBlocks, block.Text)
 				}
 			case ReasoningBlock:
-				if block.Text != "" {
-					rb := block
-					// If transitioning to a non-Bedrock provider, strip Bedrock-specific signatures
-					// that foreign backends reject or misunderstand.
-					if !isBedrockTarget && rb.Signature != "" {
-						rb.Signature = ""
+				rb := block
+				// If transitioning to a non-Bedrock provider, strip Bedrock-specific signatures
+				// that foreign backends reject or misunderstand.
+				if !isBedrockTarget && rb.Signature != "" {
+					rb.Signature = ""
+				}
+				// Handle OpenRouter reasoning_details: strip for non-OpenRouter targets,
+				// or filter by vendor format compatibility and matching tool_use ID.
+				if len(rb.ReasoningDetails) > 0 {
+					if !isOpenRouterTarget {
+						rb.ReasoningDetails = nil
+					} else {
+						rb.ReasoningDetails = filterReasoningDetailsForOpenRouter(rb.ReasoningDetails, targetProvider, msgToolUseIDs)
 					}
-					cleanBlocks = append(cleanBlocks, rb)
-					reasoningText = append(reasoningText, block.Text)
+				}
+				// Drop empty ReasoningBlock (no text, no signature, no reasoning_details).
+				if rb.Text == "" && rb.Signature == "" && len(rb.ReasoningDetails) == 0 {
+					continue
+				}
+				cleanBlocks = append(cleanBlocks, rb)
+				if rb.Text != "" {
+					reasoningText = append(reasoningText, rb.Text)
+				} else {
+					for _, d := range rb.ReasoningDetails {
+						if d.Text != "" {
+							reasoningText = append(reasoningText, d.Text)
+						} else if d.Summary != "" {
+							reasoningText = append(reasoningText, d.Summary)
+						}
+					}
 				}
 			case ToolUseBlock:
 				if block.ToolUseID != "" && block.Name != "" {
@@ -184,10 +217,10 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 			hasToolUse := false
 			hasText := false
 			for _, cb := range cleanBlocks {
-				if _, ok := cb.(ToolUseBlock); ok {
+				switch cb.(type) {
+				case ToolUseBlock:
 					hasToolUse = true
-				}
-				if _, ok := cb.(TextBlock); ok {
+				case TextBlock:
 					hasText = true
 				}
 			}
@@ -197,7 +230,8 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 					// Convert reasoning to standard text block
 					cleanBlocks = []ContentBlock{TextBlock{Text: strings.Join(reasoningText, "\n")}}
 				} else {
-					// Drop empty assistant turns that cause upstream 400s
+					// Drop empty or encrypted-only assistant turns with no text or tool calls
+					// that upstream providers (e.g. Google/OpenRouter) reject with 400.
 					continue
 				}
 			}
@@ -212,4 +246,57 @@ func SanitizeHistoryForProvider(msgs []Message, targetProvider string) []Message
 	}
 
 	return sanitized
+}
+
+// filterReasoningDetailsForOpenRouter keeps only ReasoningDetails whose Format is
+// compatible with the target OpenRouter vendor (e.g. "openrouter:google/...") and,
+// for reasoning.encrypted items with a non-empty ID, verifies a matching ToolUseBlock
+// exists in the same assistant message.
+func filterReasoningDetailsForOpenRouter(details []ReasoningDetail, targetProvider string, msgToolUseIDs map[string]bool) []ReasoningDetail {
+	modelPath := strings.TrimPrefix(targetProvider, "openrouter:")
+	vendor := ""
+	if idx := strings.IndexByte(modelPath, '/'); idx > 0 {
+		vendor = strings.ToLower(modelPath[:idx])
+	}
+
+	var kept []ReasoningDetail
+	for _, d := range details {
+		if !reasoningFormatMatchesVendor(d.Format, vendor) {
+			continue
+		}
+		if d.Type == "reasoning.encrypted" && d.ID != "" && !msgToolUseIDs[d.ID] {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// reasoningFormatMatchesVendor checks whether a reasoning_detail format string
+// is compatible with the target OpenRouter vendor prefix (e.g. "google", "anthropic", "openai").
+func reasoningFormatMatchesVendor(format, vendor string) bool {
+	f := strings.ToLower(strings.TrimSpace(format))
+	if f == "" {
+		return true
+	}
+	switch {
+	case strings.HasPrefix(f, "google-"):
+		return vendor == "google"
+	case strings.HasPrefix(f, "anthropic-"):
+		return vendor == "anthropic"
+	case strings.HasPrefix(f, "openai-"):
+		return vendor == "openai"
+	case strings.HasPrefix(f, "xai-"):
+		return vendor == "x-ai" || vendor == "xai"
+	default:
+		// Unknown/generic format: allow only if the vendor prefix appears in the format
+		// or no vendor could be parsed.
+		if vendor == "" {
+			return true
+		}
+		return strings.HasPrefix(f, vendor+"-") || strings.HasPrefix(f, vendor+"_") || f == vendor
+	}
 }

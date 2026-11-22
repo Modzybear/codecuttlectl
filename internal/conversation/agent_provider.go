@@ -63,6 +63,12 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 
 		// Build assistant message for history
 		var assistBlocks []provider.ContentBlock
+		if resp.Reasoning != "" || len(resp.ReasoningDetails) > 0 {
+			assistBlocks = append(assistBlocks, provider.ReasoningBlock{
+				Text:             resp.Reasoning,
+				ReasoningDetails: resp.ReasoningDetails,
+			})
+		}
 		if resp.Content != "" {
 			assistBlocks = append(assistBlocks, provider.TextBlock{Text: resp.Content})
 		}
@@ -157,12 +163,8 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		})
 		a.dirty = true
 
-		// Compact old tool results to keep context window manageable for small models
-		if a.needsGroundingAssist() {
-			a.provHistory, _ = compact.CompactProviderIfNeeded(
-				a.provHistory, a.turn, 0, 0, compact.SmallModelConfig(),
-			)
-		}
+		// Compact old tool results to bound context growth across long tool chains.
+		a.compactProviderHistory(resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheWriteTokens)
 
 		a.flushSessionProvider()
 
@@ -205,9 +207,11 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 
 		var textBuf strings.Builder
 		var reasoningBuf strings.Builder
+		var reasoningDetails []provider.ReasoningDetail
 		var toolCalls []pendingToolCall
 		var currentToolInput strings.Builder
 		var currentToolID, currentToolName, currentToolSig string
+		var lastCallTotalTokens int32
 
 		// Bedrock can fail mid-stream with transient errors (e.g.
 		// InternalServerException) or reject the request outright with
@@ -221,9 +225,11 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		for attempt := 0; ; attempt++ {
 			textBuf.Reset()
 			reasoningBuf.Reset()
+			reasoningDetails = nil
 			toolCalls = nil
 			currentToolInput.Reset()
 			currentToolID, currentToolName, currentToolSig = "", "", ""
+			lastCallTotalTokens = 0
 
 			if err := ctx.Err(); err != nil {
 				return textBuf.String(), err
@@ -243,7 +249,12 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 					reasoningBuf.WriteString(e.Text)
 
 				case provider.ReasoningSignatureEvent:
-					currentToolSig = e.Signature
+					if e.Signature != "" {
+						currentToolSig = e.Signature
+					}
+					if len(e.Details) > 0 {
+						reasoningDetails = append(reasoningDetails, e.Details...)
+					}
 
 				case provider.ToolUseStartEvent:
 					currentToolID = e.ToolUseID
@@ -281,6 +292,9 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 
 				case provider.UsageEvent:
 					a.recordTokenUsage(e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens, step)
+					if !e.InputTokensUnknown {
+						lastCallTotalTokens = e.InputTokens + e.CacheReadTokens + e.CacheWriteTokens
+					}
 
 				case provider.StreamErrorEvent:
 					// Record and keep draining until the channel closes so the
@@ -329,10 +343,11 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 
 		// Build assistant message for history
 		var assistBlocks []provider.ContentBlock
-		if reasoningBuf.Len() > 0 {
+		if reasoningBuf.Len() > 0 || currentToolSig != "" || len(reasoningDetails) > 0 {
 			assistBlocks = append(assistBlocks, provider.ReasoningBlock{
-				Text:      reasoningBuf.String(),
-				Signature: currentToolSig,
+				Text:             reasoningBuf.String(),
+				Signature:        currentToolSig,
+				ReasoningDetails: reasoningDetails,
 			})
 		}
 		if textBuf.Len() > 0 {
@@ -419,12 +434,8 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		})
 		a.dirty = true
 
-		// Compact old tool results to keep context window manageable for small models
-		if a.needsGroundingAssist() {
-			a.provHistory, _ = compact.CompactProviderIfNeeded(
-				a.provHistory, a.turn, 0, 0, compact.SmallModelConfig(),
-			)
-		}
+		// Compact old tool results to bound context growth across long tool chains.
+		a.compactProviderHistory(lastCallTotalTokens)
 
 		a.flushSessionProvider()
 
@@ -497,29 +508,59 @@ func (a *Agent) allProviderToolDefs() []provider.ToolDefinition {
 	return result
 }
 
+// compactProviderHistory compacts stale tool results in a.provHistory.
+// Small models use aggressive SmallModelConfig on every step.
+// Large models use batched DefaultConfig (preserving prefix caches across
+// consecutive tool rounds) and tighten when context usage crosses ShouldCompact.
+func (a *Agent) compactProviderHistory(lastCallTotalTokens int32) {
+	if a.needsGroundingAssist() {
+		a.provHistory, _ = compact.CompactProviderIfNeeded(
+			a.provHistory, a.turn, 0, 0, compact.SmallModelConfig(),
+		)
+		return
+	}
+
+	cfg := compact.DefaultConfig()
+	force := false
+	var contextWindow int32
+	if cwp, ok := a.provider.(provider.ContextWindowProvider); ok {
+		contextWindow = cwp.ContextWindow()
+	}
+	if compact.ShouldCompact(lastCallTotalTokens, contextWindow, cfg) {
+		cfg.PreserveRecentTurns = 3
+		cfg.PreserveRecentToolRounds = 5
+		force = true
+	}
+
+	res := compact.CompactProviderBatched(a.provHistory, a.turn, cfg, force)
+	if res.Compacted > 0 {
+		a.provHistory = res.Messages
+	}
+}
+
 // needsGroundingAssist returns true if the current provider likely benefits from
-// periodic grounding reminders. Large frontier models (Opus 4.6, etc.) have strong
-// enough internal state tracking that injecting grounding messages actually hurts —
-// the model treats the injected user message as a conversation turn boundary and
-// "resets", often re-introducing itself. Smaller/local models (Gemma 4, Llama 3,
-// Qwen 3, etc.) genuinely drift without these reminders.
-//
-// Heuristic: if the provider implements ContextWindowProvider and reports a context
-// window > 512k tokens, it's likely a frontier model that doesn't need help.
-// Models with unknown or smaller context windows get grounding assistance.
+// periodic grounding reminders. Local models (Ollama) and models explicitly
+// reporting a small context window (<= 262k tokens) get grounding assistance.
+// Cloud frontier models — including when context window is unknown (0) — do not.
 func (a *Agent) needsGroundingAssist() bool {
 	if a.provider == nil {
 		return false
 	}
 
-	// Check if the provider reports a large context window (frontier model indicator)
+	var cw int32
 	if cwp, ok := a.provider.(provider.ContextWindowProvider); ok {
-		if cwp.ContextWindow() > 512_000 {
-			return false // Large model — doesn't need grounding injection
-		}
+		cw = cwp.ContextWindow()
 	}
 
-	return true // Small/local model or unknown — inject grounding
+	effID := provider.EffectiveID(a.provider)
+	if strings.HasPrefix(effID, "ollama:") {
+		return cw <= 512_000
+	}
+
+	if cw > 0 && cw <= 262_144 {
+		return true
+	}
+	return false
 }
 
 // flushSessionProvider persists session state for provider-based conversations.

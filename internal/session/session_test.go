@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -1232,5 +1233,206 @@ func TestUnmarshalProviderHistoryDisambiguatesDuplicateToolUseIDs(t *testing.T) 
 	}
 	if tr2.ToolUseID != "call_abc_2" {
 		t.Errorf("expected disambiguated second tool result ID 'call_abc_2', got %q", tr2.ToolUseID)
+	}
+}
+
+func TestMarshalUnmarshalProviderHistoryReasoningDetailsRoundTrip(t *testing.T) {
+	idx0 := 0
+	idx1 := 1
+	original := []provider.Message{
+		{
+			Role: provider.RoleAssistant,
+			Content: []provider.ContentBlock{
+				provider.ReasoningBlock{
+					Text:      "thinking through the file read",
+					Signature: "legacy-sig",
+					ReasoningDetails: []provider.ReasoningDetail{
+						{
+							Type:      "reasoning.text",
+							ID:        "reason_1",
+							Format:    "google-gemini-v1",
+							Index:     &idx0,
+							Text:      "thinking through the file read",
+							Signature: "text-sig",
+						},
+						{
+							Type:   "reasoning.encrypted",
+							ID:     "call_1",
+							Format: "google-gemini-v1",
+							Index:  &idx1,
+							Data:   "ZW5jcnlwdGVkX3Rob3VnaHRfc2lnbmF0dXJl",
+						},
+					},
+				},
+				provider.ToolUseBlock{
+					ToolUseID: "call_1",
+					Name:      "read_file",
+					Input:     json.RawMessage(`{"path":"main.go"}`),
+				},
+			},
+		},
+	}
+
+	serialized, err := MarshalProviderHistory(original)
+	if err != nil {
+		t.Fatalf("MarshalProviderHistory() error: %v", err)
+	}
+
+	// Mutate original slice and Index pointer to verify defensive copy in MarshalProviderHistory.
+	origRB := original[0].Content[0].(provider.ReasoningBlock)
+	origRB.ReasoningDetails[1].Data = "mutated"
+	*origRB.ReasoningDetails[0].Index = 99
+
+	// JSON round-trip
+	raw, err := json.Marshal(serialized)
+	if err != nil {
+		t.Fatalf("json.Marshal() error: %v", err)
+	}
+	var decoded []Message
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error: %v", err)
+	}
+
+	restored := UnmarshalProviderHistory(decoded)
+	if len(restored) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(restored))
+	}
+	if len(restored[0].Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(restored[0].Content))
+	}
+
+	rb, ok := restored[0].Content[0].(provider.ReasoningBlock)
+	if !ok {
+		t.Fatalf("expected provider.ReasoningBlock, got %T", restored[0].Content[0])
+	}
+	if rb.Text != "thinking through the file read" {
+		t.Errorf("expected reasoning text preserved, got %q", rb.Text)
+	}
+	if rb.Signature != "legacy-sig" {
+		t.Errorf("expected signature 'legacy-sig', got %q", rb.Signature)
+	}
+
+	wantIdx0 := 0
+	wantIdx1 := 1
+	wantDetails := []provider.ReasoningDetail{
+		{
+			Type:      "reasoning.text",
+			ID:        "reason_1",
+			Format:    "google-gemini-v1",
+			Index:     &wantIdx0,
+			Text:      "thinking through the file read",
+			Signature: "text-sig",
+		},
+		{
+			Type:   "reasoning.encrypted",
+			ID:     "call_1",
+			Format: "google-gemini-v1",
+			Index:  &wantIdx1,
+			Data:   "ZW5jcnlwdGVkX3Rob3VnaHRfc2lnbmF0dXJl",
+		},
+	}
+	if !reflect.DeepEqual(rb.ReasoningDetails, wantDetails) {
+		t.Errorf("ReasoningDetails mismatch:\n got: %+v\nwant: %+v", rb.ReasoningDetails, wantDetails)
+	}
+}
+
+func TestUnmarshalProviderHistoryRemapsReasoningDetailIDsOnDuplicateToolUseID(t *testing.T) {
+	idx0 := 0
+	idx1 := 1
+	serialized := []Message{
+		{
+			Role: "assistant",
+			Blocks: []ContentItem{
+				{
+					Type: "reasoning",
+					Text: "first turn reasoning",
+					ReasoningDetails: []provider.ReasoningDetail{
+						{
+							Type:   "reasoning.encrypted",
+							ID:     "call_1",
+							Format: "google-gemini-v1",
+							Index:  &idx0,
+							Data:   "sig_turn_1",
+						},
+					},
+				},
+				{Type: "tool_use", ToolUseID: "call_1", Name: "read_file", Input: json.RawMessage(`{"path":"a.go"}`)},
+			},
+		},
+		{
+			Role: "user",
+			Blocks: []ContentItem{
+				{Type: "tool_result", ResultFor: "call_1", Content: "contents of a.go"},
+			},
+		},
+		{
+			Role: "assistant",
+			Blocks: []ContentItem{
+				{
+					Type: "reasoning",
+					Text: "second turn reasoning",
+					ReasoningDetails: []provider.ReasoningDetail{
+						{
+							Type:   "reasoning.text",
+							ID:     "unrelated_id",
+							Format: "google-gemini-v1",
+							Index:  &idx0,
+							Text:   "second turn reasoning",
+						},
+						{
+							Type:   "reasoning.encrypted",
+							ID:     "call_1",
+							Format: "google-gemini-v1",
+							Index:  &idx1,
+							Data:   "sig_turn_2",
+						},
+					},
+				},
+				{Type: "tool_use", ToolUseID: "call_1", Name: "read_file", Input: json.RawMessage(`{"path":"b.go"}`)},
+			},
+		},
+		{
+			Role: "user",
+			Blocks: []ContentItem{
+				{Type: "tool_result", ResultFor: "call_1", Content: "contents of b.go"},
+			},
+		},
+	}
+
+	restored := UnmarshalProviderHistory(serialized)
+	if len(restored) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(restored))
+	}
+
+	rb1 := restored[0].Content[0].(provider.ReasoningBlock)
+	tu1 := restored[0].Content[1].(provider.ToolUseBlock)
+	tr1 := restored[1].Content[0].(provider.ToolResultBlock)
+	rb2 := restored[2].Content[0].(provider.ReasoningBlock)
+	tu2 := restored[2].Content[1].(provider.ToolUseBlock)
+	tr2 := restored[3].Content[0].(provider.ToolResultBlock)
+
+	if tu1.ToolUseID != "call_1" || tr1.ToolUseID != "call_1" {
+		t.Errorf("expected first turn tool IDs 'call_1', got tu=%q tr=%q", tu1.ToolUseID, tr1.ToolUseID)
+	}
+	if len(rb1.ReasoningDetails) != 1 || rb1.ReasoningDetails[0].ID != "call_1" {
+		t.Errorf("expected first turn ReasoningDetail.ID 'call_1', got %+v", rb1.ReasoningDetails)
+	}
+
+	if tu2.ToolUseID != "call_1_2" || tr2.ToolUseID != "call_1_2" {
+		t.Errorf("expected second turn tool IDs 'call_1_2', got tu=%q tr=%q", tu2.ToolUseID, tr2.ToolUseID)
+	}
+	if len(rb2.ReasoningDetails) != 2 {
+		t.Fatalf("expected 2 ReasoningDetails in second turn, got %d", len(rb2.ReasoningDetails))
+	}
+	if rb2.ReasoningDetails[0].ID != "unrelated_id" {
+		t.Errorf("expected unrelated ReasoningDetail.ID unchanged, got %q", rb2.ReasoningDetails[0].ID)
+	}
+	if rb2.ReasoningDetails[1].ID != "call_1_2" {
+		t.Errorf("expected second turn ReasoningDetail.ID remapped to 'call_1_2', got %q", rb2.ReasoningDetails[1].ID)
+	}
+
+	// Verify caller's input slice was not mutated.
+	if serialized[2].Blocks[0].ReasoningDetails[1].ID != "call_1" {
+		t.Errorf("input serialized slice was mutated: got ID %q, want 'call_1'", serialized[2].Blocks[0].ReasoningDetails[1].ID)
 	}
 }

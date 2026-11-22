@@ -30,6 +30,9 @@ type ContentItem struct {
 	// For Type=="tool_use": thought signature attached to function call (Gemini 3)
 	Signature string `json:"signature,omitempty"`
 
+	// For Type=="reasoning": structured OpenRouter reasoning items (e.g. encrypted signatures)
+	ReasoningDetails []providerPkg.ReasoningDetail `json:"reasoning_details,omitempty"`
+
 	// For Type=="tool_use": the tool invocation details
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Name      string          `json:"name,omitempty"`
@@ -89,14 +92,16 @@ func UnmarshalProviderHistory(messages []Message) []providerPkg.Message {
 		}
 
 		var blocks []providerPkg.ContentBlock
+		var msgIDRemap map[string]string
 		for _, item := range msg.Blocks {
 			switch item.Type {
 			case "text":
 				blocks = append(blocks, providerPkg.TextBlock{Text: item.Text})
 			case "reasoning":
 				blocks = append(blocks, providerPkg.ReasoningBlock{
-					Text:      item.Text,
-					Signature: item.Signature,
+					Text:             item.Text,
+					Signature:        item.Signature,
+					ReasoningDetails: cloneReasoningDetails(item.ReasoningDetails),
 				})
 			case "tool_use":
 				input := json.RawMessage(item.Input)
@@ -107,6 +112,10 @@ func UnmarshalProviderHistory(messages []Message) []providerPkg.Message {
 				toolUseCounts[toolUseID]++
 				if count := toolUseCounts[toolUseID]; count > 1 {
 					toolUseID = fmt.Sprintf("%s_%d", toolUseID, count)
+					if msgIDRemap == nil {
+						msgIDRemap = make(map[string]string)
+					}
+					msgIDRemap[item.ToolUseID] = toolUseID
 				}
 				toolNames[toolUseID] = item.Name
 				toolNames[item.ToolUseID] = item.Name
@@ -137,10 +146,50 @@ func UnmarshalProviderHistory(messages []Message) []providerPkg.Message {
 			}
 		}
 
+		// Keep ReasoningDetail.ID in sync with disambiguated tool_use IDs within
+		// the same message (reasoning blocks typically precede tool_use blocks).
+		if len(msgIDRemap) > 0 {
+			for bi, blk := range blocks {
+				rb, ok := blk.(providerPkg.ReasoningBlock)
+				if !ok || len(rb.ReasoningDetails) == 0 {
+					continue
+				}
+				changed := false
+				details := make([]providerPkg.ReasoningDetail, len(rb.ReasoningDetails))
+				copy(details, rb.ReasoningDetails)
+				for k, d := range details {
+					if newID, ok := msgIDRemap[d.ID]; ok {
+						details[k].ID = newID
+						changed = true
+					}
+				}
+				if changed {
+					rb.ReasoningDetails = details
+					blocks[bi] = rb
+				}
+			}
+		}
+
 		result = append(result, providerPkg.Message{Role: role, Content: blocks})
 	}
 
 	return result
+}
+
+// cloneReasoningDetails returns a defensive copy of details (or nil if empty).
+func cloneReasoningDetails(details []providerPkg.ReasoningDetail) []providerPkg.ReasoningDetail {
+	if len(details) == 0 {
+		return nil
+	}
+	cloned := make([]providerPkg.ReasoningDetail, len(details))
+	for i, d := range details {
+		if d.Index != nil {
+			idx := *d.Index
+			d.Index = &idx
+		}
+		cloned[i] = d
+	}
+	return cloned
 }
 
 // marshalProviderBlock converts a provider ContentBlock to a session ContentItem.
@@ -149,7 +198,12 @@ func marshalProviderBlock(block providerPkg.ContentBlock) ContentItem {
 	case providerPkg.TextBlock:
 		return ContentItem{Type: "text", Text: b.Text}
 	case providerPkg.ReasoningBlock:
-		return ContentItem{Type: "reasoning", Text: b.Text, Signature: b.Signature}
+		return ContentItem{
+			Type:             "reasoning",
+			Text:             b.Text,
+			Signature:        b.Signature,
+			ReasoningDetails: cloneReasoningDetails(b.ReasoningDetails),
+		}
 	case providerPkg.ToolUseBlock:
 		input := json.RawMessage(b.Input)
 		if len(input) == 0 {
