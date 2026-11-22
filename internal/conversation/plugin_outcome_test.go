@@ -73,9 +73,21 @@ func TestBuiltPluginFailurePropagation(t *testing.T) {
 		if advice := agent.reconciler.Advise(agent.inkwell); advice.InjectPrompt == "" {
 			t.Fatal("failed execution did not produce diagnostic advice")
 		}
-		// C10: Inkwell advice is now injected into the system prompt for the subsequent round
+		// C10: Inkwell advice is injected into the system prompt for the continuation round
 		if len(model.systems) != 2 || !strings.Contains(model.systems[1], "Inkwell Diagnostic Alert") {
 			t.Fatalf("streaming=%v: expected Inkwell Diagnostic Alert injected into round 2 system prompt, got: %q", streaming, model.systems)
+		}
+		// A brand new user turn must NOT carry over stale Inkwell advice from a prior turn.
+		if streaming {
+			_, err = agent.StreamTurn(ctx, "Start a fresh unrelated task", nil)
+		} else {
+			_, err = agent.Turn(ctx, "Start a fresh unrelated task")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(model.systems) != 3 || strings.Contains(model.systems[2], "Inkwell Diagnostic Alert") {
+			t.Fatalf("streaming=%v: stale Inkwell Diagnostic Alert leaked into next user turn: %q", streaming, model.systems)
 		}
 		if len(agent.inkwell) != 1 || !agent.inkwell[0].IsError || agent.inkwell[0].ErrorType == "" {
 			t.Fatalf("Inkwell lost failure: %+v", agent.inkwell)

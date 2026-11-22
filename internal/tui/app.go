@@ -111,8 +111,9 @@ type Model struct {
 	currentToolName  string
 	currentToolInput *strings.Builder
 	currentToolSig      string // ThoughtSignature for current tool being streamed
-	pendingToolCalls    []pendingTool
-	streamServerRetries int // Transient network/server retry counter for the active stream round
+	pendingToolCalls      []pendingTool
+	streamServerRetries   int                                    // Transient network/server retry counter for the active stream round
+	transientRetryDelayFn func(int, error) time.Duration         // Optional test override for transient stream retry backoff (defaults to provider.RetryDelay)
 
 	// Active tool execution streaming state
 	activeToolName   string           // Name of currently executing tool
@@ -955,14 +956,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewportContent()
 		return m, m.readNextStreamEvent()
 
+	case StreamServerRetryFireMsg:
+		if !m.streaming || msg.Generation != m.streamGeneration {
+			return m, nil
+		}
+		return m, m.launchStream()
+
 	case StreamErrorMsg:
 		m.stopModelStream()
 		if (m.llmProvider != nil || m.client != nil) &&
 			provider.IsTransientStreamError(msg.Err) &&
 			m.streamServerRetries < 3 {
+			attempt := m.streamServerRetries
 			m.streamServerRetries++
 			m.streamBuf.Reset()
 			m.reasoningBuf.Reset()
+			m.reasoningSignature = ""
 			m.reasoningDetails = nil
 			m.pendingToolCalls = nil
 			m.currentToolInput.Reset()
@@ -970,9 +979,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentToolName = ""
 			m.currentToolSig = ""
 			m.inReasoning = false
-			m.retryReason = fmt.Sprintf("Transient network error: retry %d/3", m.streamServerRetries)
+			m.streamCh = nil
+			delayFn := m.transientRetryDelayFn
+			if delayFn == nil {
+				delayFn = provider.RetryDelay
+			}
+			delay := delayFn(attempt, msg.Err)
+			m.retryUntil = time.Now().Add(delay)
+			m.retryAttempt = m.streamServerRetries
+			m.retryMax = 3
+			m.retryReason = "transient network error"
+			gen := m.streamGeneration
 			m.updateViewportContent()
-			return m, m.launchStream()
+			return m, tea.Tick(delay, func(time.Time) tea.Msg {
+				return StreamServerRetryFireMsg{Generation: gen}
+			})
 		}
 		m.streamServerRetries = 0
 		m.streaming = false
@@ -1080,7 +1101,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Process any todo updates safely in the Update handler (single-threaded)
 		todoIdx := 0
 		for i := range msg.Messages {
-			if msg.Messages[i].Content == "" && todoIdx < len(msg.TodoInputs) {
+			if msg.Messages[i].Name == "todo_manage" && msg.Messages[i].Content == "" && todoIdx < len(msg.TodoInputs) {
 				// This is a todo_manage placeholder — apply it now
 				var payload struct {
 					Todos []todo.Item `json:"todos"`
@@ -1555,7 +1576,7 @@ func (m *Model) launchStream() tea.Cmd {
 	if m.rolloverState == rollover.StateArmed && m.rolloverArmedCtxPct > 0 {
 		effectiveSystem += "\n\n" + rollover.ArmedSystemHint(m.rolloverArmedCtxPct)
 	}
-	if m.agent != nil {
+	if m.agent != nil && m.streamStep > 0 && m.rolloverState != rollover.StateCloseout {
 		if advice := m.agent.InkwellAdvice(); advice != "" {
 			effectiveSystem += "\n\n" + advice
 		}
@@ -1877,11 +1898,13 @@ func (m *Model) executeToolBatch(priorResults []provider.ToolResultBlock, priorT
 			}
 
 			// Check if this tool invocation requires user approval
+			approvedByAuto := false
 			if req := approval.Check(tool.name, string(tool.input)); req != nil {
 				req.ToolUseID = tool.id
 
 				if autoApprove {
 					// Auto-approve mode: proceed without prompting
+					approvedByAuto = true
 				} else {
 					// Build remaining tools list
 					var remaining []pendingToolForApproval
@@ -1914,7 +1937,13 @@ func (m *Model) executeToolBatch(priorResults []provider.ToolResultBlock, priorT
 			var output string
 			var isErr bool
 			if m.agent != nil {
-				res, status := m.agent.ExecuteTool(ctx, tool.name, tool.input)
+				var res string
+				var status types.ToolResultStatus
+				if approvedByAuto {
+					res, status = m.agent.ExecuteToolApproved(ctx, tool.name, tool.input)
+				} else {
+					res, status = m.agent.ExecuteTool(ctx, tool.name, tool.input)
+				}
 				output = res
 				isErr = (status == types.ToolResultStatusError)
 			} else {

@@ -20,6 +20,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/prompt"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
 	"github.com/Modzybear/codecuttlectl/internal/provider/openrouter"
+	"github.com/Modzybear/codecuttlectl/internal/rollover"
 	"github.com/Modzybear/codecuttlectl/internal/swarm"
 )
 
@@ -373,5 +374,139 @@ func TestTUIMaxStepsParity(t *testing.T) {
 	}
 	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].content, "exceeded maximum steps (1)") {
 		t.Fatalf("expected max steps error message in TUI, got %+v", m.messages)
+	}
+}
+
+func TestTUIInkwellAdviceDoesNotLeakAcrossTurnsOrCloseout(t *testing.T) {
+	p := &recordingRuntimeProvider{id: "fixture:lead"}
+	manager := pluginhost.NewManager(false)
+	agent, err := conversation.NewAgent(conversation.Config{
+		Provider:  p,
+		PluginMgr: manager,
+		WorkDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record a failed tool execution in Inkwell
+	_, status := agent.ExecuteTool(context.Background(), "nonexistent_tool", json.RawMessage(`{}`))
+	if status != types.ToolResultStatusError {
+		t.Fatalf("expected error status, got %v", status)
+	}
+	if agent.InkwellAdvice() == "" {
+		t.Fatal("expected non-empty InkwellAdvice after tool failure")
+	}
+
+	m := New(Config{
+		Provider:  p,
+		Agent:     agent,
+		PluginMgr: manager,
+	})
+	defer m.stopModelStream()
+
+	// Step 0 (fresh user turn): must NOT inject stale Inkwell advice
+	m.submitMessage("fresh user turn")
+	if len(p.requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(p.requests))
+	}
+	if strings.Contains(p.requests[0], "Inkwell Diagnostic Alert") {
+		t.Fatalf("fresh turn (streamStep=0) must not inject stale Inkwell advice: %q", p.requests[0])
+	}
+
+	// Continuation step (streamStep > 0) in StateNormal: MUST inject Inkwell advice
+	m.streamStep = 1
+	m.launchStream()
+	if len(p.requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(p.requests))
+	}
+	if !strings.Contains(p.requests[1], "Inkwell Diagnostic Alert") {
+		t.Fatalf("continuation step (streamStep=1) must inject Inkwell advice: %q", p.requests[1])
+	}
+
+	// Rollover closeout (even with streamStep > 0): must NOT inject Inkwell advice
+	m.rolloverState = rollover.StateCloseout
+	m.launchStream()
+	if len(p.requests) != 3 {
+		t.Fatalf("expected 3 requests, got %d", len(p.requests))
+	}
+	if strings.Contains(p.requests[2], "Inkwell Diagnostic Alert") {
+		t.Fatalf("rollover closeout must not inject Inkwell advice: %q", p.requests[2])
+	}
+}
+
+func TestTUITodoManageMatchesByNameNotEmptyContent(t *testing.T) {
+	p := &recordingRuntimeProvider{id: "fixture:lead"}
+	m := New(Config{
+		Provider:  p,
+		PluginMgr: pluginhost.NewManager(false),
+	})
+	defer m.stopModelStream()
+
+	updated, _ := m.Update(ContinueStreamMsg{
+		Messages: []provider.ToolResultBlock{
+			{ToolUseID: "bash_1", Name: "bash_exec", Content: ""},
+			{ToolUseID: "todo_1", Name: "todo_manage", Content: ""},
+		},
+		TodoInputs: []json.RawMessage{
+			json.RawMessage(`{"todos":[{"content":"task A","status":"in_progress","priority":"high"}]}`),
+		},
+	})
+	m = updated.(Model)
+
+	if len(m.history) == 0 {
+		t.Fatal("expected tool result message appended to history")
+	}
+	last := m.history[len(m.history)-1]
+	if len(last.Content) != 2 {
+		t.Fatalf("expected 2 tool result blocks, got %d", len(last.Content))
+	}
+	bashRes := last.Content[0].(provider.ToolResultBlock)
+	todoRes := last.Content[1].(provider.ToolResultBlock)
+	if bashRes.Content != "" {
+		t.Fatalf("bash_exec empty output was overwritten by todo_manage: %q", bashRes.Content)
+	}
+	if !strings.Contains(todoRes.Content, "Todo list updated") {
+		t.Fatalf("expected todo_manage placeholder to be populated, got: %q", todoRes.Content)
+	}
+}
+
+func TestTUIAutoApproveBypassesAgentApprovalGate(t *testing.T) {
+	p := &recordingRuntimeProvider{id: "fixture:lead"}
+	manager := pluginhost.NewManager(false)
+	// Agent has AutoApprove=false and no ApprovalFunc, while TUI Model has AutoApprove=true.
+	agent, err := conversation.NewAgent(conversation.Config{
+		Provider:    p,
+		PluginMgr:   manager,
+		WorkDir:     t.TempDir(),
+		AutoApprove: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(Config{
+		Provider:    p,
+		Agent:       agent,
+		PluginMgr:   manager,
+		AutoApprove: true,
+	})
+	m.pendingToolCalls = []pendingTool{
+		{
+			id:    "call_rm",
+			name:  "bash_exec",
+			input: json.RawMessage(`{"command":"rm -rf /tmp/nonexistent_cuttle_test_dir"}`),
+		},
+	}
+
+	msg := m.executePendingTools()()
+	cont, ok := msg.(ContinueStreamMsg)
+	if !ok {
+		t.Fatalf("expected ContinueStreamMsg under autoApprove, got %T", msg)
+	}
+	if len(cont.Messages) != 1 {
+		t.Fatalf("expected 1 tool result, got %d", len(cont.Messages))
+	}
+	if strings.Contains(cont.Messages[0].Content, "requires user approval") {
+		t.Fatalf("TUI autoApprove should bypass Agent approval gate via ExecuteToolApproved, got: %q", cont.Messages[0].Content)
 	}
 }

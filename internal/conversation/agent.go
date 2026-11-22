@@ -122,18 +122,27 @@ func NewAgent(cfg Config) (*Agent, error) {
 		primaryID = PrimaryNodeID(cfg.Morph)
 	}
 
-	// Resolve provider from pool for the target node (or primary)
+	// Resolve provider/client from pool for the target node (or primary)
 	if cfg.Client == nil && cfg.Pool != nil {
 		if bp, ok := cfg.Pool.(interface{ BedrockPool() *bedrock.ModelPool }); ok {
-			cfg.Client = bp.BedrockPool().Primary()
+			bpool := bp.BedrockPool()
+			if primaryID != "" {
+				cfg.Client = bpool.Get(bedrock.ModelRole(primaryID))
+			} else {
+				cfg.Client = bpool.Primary()
+			}
 		} else if primaryID != "" {
 			if nodeProv, ok := cfg.Pool.GetNode(primaryID); ok && nodeProv != nil {
 				cfg.Provider = nodeProv
-			} else if primary := cfg.Pool.Primary(); primary != nil {
+			} else if cfg.Provider == nil {
+				if primary := cfg.Pool.Primary(); primary != nil {
+					cfg.Provider = primary
+				}
+			}
+		} else if cfg.Provider == nil {
+			if primary := cfg.Pool.Primary(); primary != nil {
 				cfg.Provider = primary
 			}
-		} else if primary := cfg.Pool.Primary(); primary != nil {
-			cfg.Provider = primary
 		}
 	}
 	var swarmNodes []string

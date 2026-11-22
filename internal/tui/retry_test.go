@@ -213,10 +213,38 @@ func TestTransientConnectionResetStreamAutoRetriesInTUI(t *testing.T) {
 
 	m := New(Config{PluginMgr: pluginhost.NewManager(false)})
 	m.llmProvider = openrouter.New(openrouter.Config{BaseURL: server.URL})
+	m.transientRetryDelayFn = func(int, error) time.Duration { return time.Millisecond }
 	m.submitMessage("hello")
 	defer m.stopModelStream()
 
-	// Drain attempt 1 (partial text followed by unexpected EOF -> StreamErrorMsg triggers auto-retry)
+	// Drain attempt 1 (partial text followed by unexpected EOF -> StreamErrorMsg schedules backoff retry)
+	var retryCmd tea.Cmd
+	for i := 0; i < 20 && m.streaming; i++ {
+		if m.streamCh == nil {
+			break
+		}
+		ev := m.readNextStreamEvent()()
+		var cmd tea.Cmd
+		updated, cmd := m.Update(ev)
+		m = updated.(Model)
+		if m.streamCh == nil && cmd != nil {
+			retryCmd = cmd
+			break
+		}
+	}
+
+	if retryCmd == nil {
+		t.Fatal("expected backoff retry command to be scheduled after transient stream drop")
+	}
+	if !strings.Contains(m.renderInput(), "Upstream transient network error: retry 1/3") {
+		t.Fatalf("expected transient retry countdown in input bar, got: %q", m.renderInput())
+	}
+
+	// Execute backoff timer -> fires StreamServerRetryFireMsg -> launches attempt 2
+	fireMsg := retryCmd()
+	updated, _ := m.Update(fireMsg)
+	m = updated.(Model)
+
 	for i := 0; i < 20 && m.streaming; i++ {
 		if m.streamCh == nil {
 			break
@@ -231,5 +259,56 @@ func TestTransientConnectionResetStreamAutoRetriesInTUI(t *testing.T) {
 	}
 	if len(m.messages) == 0 || m.messages[len(m.messages)-1].content != "recovered response" {
 		t.Fatalf("expected clean 'recovered response' without partial prefix, got %+v", m.messages)
+	}
+}
+
+func TestTransientRetryCancelDuringBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sse(`{"choices":[{"delta":{"content":"partial "}}]}`))
+	}))
+	defer server.Close()
+
+	m := New(Config{PluginMgr: pluginhost.NewManager(false)})
+	m.llmProvider = openrouter.New(openrouter.Config{BaseURL: server.URL})
+	m.transientRetryDelayFn = func(int, error) time.Duration { return time.Millisecond }
+	m.submitMessage("hello")
+	defer m.stopModelStream()
+
+	var retryCmd tea.Cmd
+	for i := 0; i < 20 && m.streaming && m.streamCh != nil; i++ {
+		ev := m.readNextStreamEvent()()
+		updated, cmd := m.Update(ev)
+		m = updated.(Model)
+		if m.streamCh == nil && cmd != nil {
+			retryCmd = cmd
+			break
+		}
+	}
+	if retryCmd == nil {
+		t.Fatal("expected backoff retry command")
+	}
+
+	// Cancel with Esc twice during backoff
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = updated.(Model)
+	if m.streaming {
+		t.Fatal("expected streaming=false after double Esc during backoff")
+	}
+
+	// Firing the stale backoff timer must be ignored (no second request)
+	fireMsg := retryCmd()
+	updated, cmd := m.Update(fireMsg)
+	m = updated.(Model)
+	if cmd != nil || m.streaming || attempts.Load() != 1 {
+		t.Fatalf("stale backoff timer should not launch retry: streaming=%v attempts=%d", m.streaming, attempts.Load())
 	}
 }

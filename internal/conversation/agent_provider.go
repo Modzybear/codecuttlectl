@@ -49,8 +49,10 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		if hint := a.armedSystemHint(); hint != "" {
 			effectivePrompt += "\n\n" + hint
 		}
-		if advice := a.InkwellAdvice(); advice != "" {
-			effectivePrompt += "\n\n" + advice
+		if step > 0 {
+			if advice := a.InkwellAdvice(); advice != "" {
+				effectivePrompt += "\n\n" + advice
+			}
 		}
 
 		req := provider.Request{
@@ -236,8 +238,10 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		if hint := a.armedSystemHint(); hint != "" {
 			effectivePrompt += "\n\n" + hint
 		}
-		if advice := a.InkwellAdvice(); advice != "" {
-			effectivePrompt += "\n\n" + advice
+		if step > 0 {
+			if advice := a.InkwellAdvice(); advice != "" {
+				effectivePrompt += "\n\n" + advice
+			}
 		}
 
 		req := provider.Request{

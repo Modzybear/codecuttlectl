@@ -19,6 +19,11 @@ type streamEnvelope struct {
 // StreamRetryMsg reports adapter-owned backoff without adding conversation text.
 type StreamRetryMsg provider.RetryEvent
 
+// StreamServerRetryFireMsg fires after a TUI-owned transient stream backoff timer elapses.
+type StreamServerRetryFireMsg struct {
+	Generation uint64
+}
+
 // StreamStartMsg signals that streaming has begun for a new turn.
 type StreamStartMsg struct{}
 
