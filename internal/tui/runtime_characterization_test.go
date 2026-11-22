@@ -3,6 +3,10 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +19,7 @@ import (
 	"github.com/Modzybear/codecuttlectl/internal/pluginhost"
 	"github.com/Modzybear/codecuttlectl/internal/prompt"
 	"github.com/Modzybear/codecuttlectl/internal/provider"
+	"github.com/Modzybear/codecuttlectl/internal/provider/openrouter"
 	"github.com/Modzybear/codecuttlectl/internal/swarm"
 )
 
@@ -60,6 +65,9 @@ func TestTUICatalogAndTodoAuthorization(t *testing.T) {
 	if len(p.requests) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(p.requests))
 	}
+	if strings.Contains(p.requests[0], "todo_manage") {
+		t.Fatalf("expected tool catalog to exclude todo_manage when restricted by workbench, got %s", p.requests[0])
+	}
 	input := json.RawMessage(`{"todos":[{"content":"forged native task","status":"pending","priority":"medium"}]}`)
 	if _, status := agent.ExecuteTool(context.Background(), "todo_manage", input); status != types.ToolResultStatusError {
 		t.Fatal("restricted Agent should deny forged todo call")
@@ -71,9 +79,19 @@ func TestTUICatalogAndTodoAuthorization(t *testing.T) {
 	if len(result.Messages) != 1 || !result.Messages[0].IsError || !strings.Contains(result.Messages[0].Content, "not authorized") {
 		t.Fatalf("expected TUI to deny unauthorized todo_manage with error result, got: %+v", result.Messages)
 	}
+
+	// Verify ContinueStreamMsg todo application also guards against unauthorized workbench mutation
+	updated, _ := m.Update(ContinueStreamMsg{
+		Messages:   []provider.ToolResultBlock{{ToolUseID: "forged", Name: "todo_manage", Content: ""}},
+		TodoInputs: []json.RawMessage{input},
+	})
+	m = updated.(Model)
+	if !m.todos.IsEmpty() {
+		t.Fatalf("expected m.todos to remain empty after denied forged todo_manage, got %v", m.todos.Items())
+	}
 }
 
-func TestKnownDivergence_TUIApprovalDeniesAgainAndLosesEarlierResults(t *testing.T) {
+func TestTUIApprovalPreservesEarlierResultsAndExecutesOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 	dir := t.TempDir()
@@ -107,17 +125,34 @@ func TestKnownDivergence_TUIApprovalDeniesAgainAndLosesEarlierResults(t *testing
 		updated, execute := m.Update(ApprovalDecisionMsg{ToolUseID: "gated", Approved: approve})
 		m = updated.(Model)
 		results := execute().(ContinueStreamMsg)
-		if len(results.Messages) != 1 || results.Messages[0].ToolUseID != "gated" || !results.Messages[0].IsError {
-			t.Fatal("baseline changed: approval continuation should lose prior result and deny gated call")
+		if len(results.Messages) != 2 {
+			t.Fatalf("expected 2 results (first + gated), got %d: %+v", len(results.Messages), results.Messages)
 		}
-		if approve && !strings.Contains(results.Messages[0].Content, "requires user approval") {
-			t.Fatalf("expected second Agent gate denial, got %q", results.Messages[0].Content)
+		if results.Messages[0].ToolUseID != "first" || results.Messages[0].IsError {
+			t.Fatalf("expected first tool result preserved with success, got %+v", results.Messages[0])
 		}
-		calls, err := os.ReadFile(filepath.Join(work, "fixture-calls.log"))
-		if err != nil || strings.Count(string(calls), "\n") != 1 {
-			t.Fatalf("inert fixture should execute only initial status: %q %v", calls, err)
+		if results.Messages[1].ToolUseID != "gated" {
+			t.Fatalf("expected second tool result to be gated, got %+v", results.Messages[1])
+		}
+		if approve {
+			if results.Messages[1].IsError {
+				t.Fatalf("expected approved tool to succeed without double-gate denial, got %s", results.Messages[1].Content)
+			}
+			calls, err := os.ReadFile(filepath.Join(work, "fixture-calls.log"))
+			if err != nil || strings.Count(string(calls), "\n") != 2 {
+				t.Fatalf("expected fixture to execute status + rebase: %q %v", calls, err)
+			}
+		} else {
+			if !results.Messages[1].IsError || !strings.Contains(results.Messages[1].Content, "denied by user") {
+				t.Fatalf("expected denied tool error result, got %+v", results.Messages[1])
+			}
+			calls, err := os.ReadFile(filepath.Join(work, "fixture-calls.log"))
+			if err != nil || strings.Count(string(calls), "\n") != 1 {
+				t.Fatalf("expected fixture to execute only status: %q %v", calls, err)
+			}
 		}
 	}
+
 	// Control: the same inert gated tool DOES run once with an Agent approval callback.
 	work := t.TempDir()
 	decisions := 0
@@ -188,5 +223,155 @@ func TestHandoffUpdatesTUIProviderAndPersona(t *testing.T) {
 	}
 	if mBack.llmProvider.ID() != "bedrock:claude-3-5" {
 		t.Fatalf("expected TUI llmProvider restored to lead, got %s", mBack.llmProvider.ID())
+	}
+}
+
+func TestCrossProviderHandoffTwoEndpointTransportRoundTrip(t *testing.T) {
+	// Endpoint A: simulates non-Gemini provider (e.g. DeepSeek/Claude via OpenRouter)
+	// Rejects any google-gemini-v1 reasoning_details if leaked back on return handoff.
+	var endpointACalls int
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		endpointACalls++
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "google-gemini-v1") {
+			http.Error(w, `{"error":{"message":"foreign google-gemini-v1 reasoning_details leaked to endpoint A","code":400}}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if endpointACalls == 1 {
+			// Step 1 on Node A: call handoff to Gemini node B (with NO Gemini thought signature)
+			fmt.Fprint(w, sse(
+				`{"choices":[{"delta":{"reasoning":"delegating to gemini specialist","tool_calls":[{"index":0,"id":"call_handoff_to_b","type":"function","function":{"name":"handoff","arguments":"{\"target\":\"gemini_node\",\"instructions\":\"inspect and return\"}"}}]}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			))
+			return
+		}
+		// Step 3 on Node A (after return handoff from B): final answer
+		fmt.Fprint(w, sse(
+			`{"choices":[{"delta":{"content":"Round-trip handoff completed cleanly!"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		))
+	}))
+	defer srvA.Close()
+
+	// Endpoint B: simulates OpenRouter Gemini endpoint ("openrouter:google/gemini-4-neon")
+	// Strictly rejects any assistant tool_calls message that lacks google-gemini-v1 reasoning.encrypted (Issue #62).
+	var endpointBCalls int
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		endpointBCalls++
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Messages []struct {
+				Role             string                      `json:"role"`
+				ToolCalls        [] json.RawMessage          `json:"tool_calls"`
+				ReasoningDetails []provider.ReasoningDetail  `json:"reasoning_details"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		for _, msg := range payload.Messages {
+			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+				hasEncrypted := false
+				for _, rd := range msg.ReasoningDetails {
+					if rd.Type == "reasoning.encrypted" && rd.Format == "google-gemini-v1" {
+						hasEncrypted = true
+						break
+					}
+				}
+				if !hasEncrypted {
+					http.Error(w, `{"error":{"message":"Function call is missing a thought_signature","code":400}}`, http.StatusBadRequest)
+					return
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Node B emits a Gemini-signed handoff back to Node A
+		fmt.Fprint(w, sse(
+			`{"choices":[{"delta":{"reasoning":"returning to lead","reasoning_details":[{"type":"reasoning.encrypted","id":"call_handoff_to_a","format":"google-gemini-v1","index":0,"data":"GEMINI_SIG_XYZ"}],"tool_calls":[{"index":0,"id":"call_handoff_to_a","type":"function","function":{"name":"handoff","arguments":"{\"target\":\"lead_node\",\"instructions\":\"done\"}"}}]}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		))
+	}))
+	defer srvB.Close()
+
+	provA := openrouter.New(openrouter.Config{BaseURL: srvA.URL, Model: "deepseek/deepseek-r1"})
+	provB := openrouter.New(openrouter.Config{BaseURL: srvB.URL, Model: "google/gemini-4-neon"})
+	pool := runtimePool{nodes: map[string]provider.Provider{
+		"lead_node":   provA,
+		"gemini_node": provB,
+	}}
+	morph := &swarm.Morphology{Nodes: map[string]swarm.Node{
+		"lead_node":   {Provider: "openrouter", Model: "deepseek/deepseek-r1", IsPrimary: true, Workbench: []string{"handoff"}},
+		"gemini_node": {Provider: "openrouter", Model: "google/gemini-4-neon", Workbench: []string{"handoff"}},
+	}}
+	pm, err := prompt.NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := pluginhost.NewManager(false)
+	agent, err := conversation.NewAgent(conversation.Config{
+		Provider:  provA,
+		Pool:      pool,
+		PluginMgr: manager,
+		PromptMgr: pm,
+		Morph:     morph,
+		WorkDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply, err := agent.StreamTurn(context.Background(), "start round trip", nil)
+	if err != nil {
+		t.Fatalf("StreamTurn round-trip failed: %v", err)
+	}
+	if reply != "Round-trip handoff completed cleanly!" {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+	if endpointACalls != 2 || endpointBCalls != 1 {
+		t.Fatalf("unexpected endpoint call counts: A=%d (want 2), B=%d (want 1)", endpointACalls, endpointBCalls)
+	}
+}
+
+func TestTUIMaxStepsParity(t *testing.T) {
+	// With MaxSteps=1, after 1 round of tool execution, TUI must halt and not issue another request
+	p := &recordingRuntimeProvider{
+		id: "fixture:lead",
+	}
+	manager := pluginhost.NewManager(false)
+	m := New(Config{
+		Provider:  p,
+		PluginMgr: manager,
+		MaxSteps:  1,
+	})
+
+	m.submitMessage("start tool run")
+	defer m.stopModelStream()
+
+	// Simulate tool result returned from the first tool step
+	updated, cmd := m.Update(ContinueStreamMsg{
+		Messages: []provider.ToolResultBlock{
+			{ToolUseID: "t1", Name: "read_file", Content: "file content"},
+		},
+	})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatal("expected nil command after reaching maxSteps=1")
+	}
+	if m.streaming {
+		t.Fatal("expected streaming=false after maxSteps exceeded")
+	}
+	if len(m.messages) == 0 || !strings.Contains(m.messages[len(m.messages)-1].content, "exceeded maximum steps (1)") {
+		t.Fatalf("expected max steps error message in TUI, got %+v", m.messages)
 	}
 }

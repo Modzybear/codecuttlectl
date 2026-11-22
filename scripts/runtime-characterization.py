@@ -124,8 +124,12 @@ def run_case(binary, plugins, mode, scenario, root):
             with lock:
                 assert not records, "typing triggered inference before Enter"
             tmux("send-keys", "-t", "runtime", "Enter")
-            output = wait_screen("RUNTIME_DONE")
-            assert "Error:" not in output and "panic:" not in output, output
+            if scenario == "limit":
+                output = wait_screen("exceeded maximum steps (1)")
+                assert "panic:" not in output, output
+            else:
+                output = wait_screen("RUNTIME_DONE")
+                assert "Error:" not in output and "panic:" not in output, output
         else:
             command += ["--message", PROMPT] if mode == "one-shot" else ["--no-tui"]
             process = subprocess.run(command, env=env, cwd=work, input=None if mode == "one-shot" else PROMPT + "\nexit\n",
@@ -139,7 +143,7 @@ def run_case(binary, plugins, mode, scenario, root):
         with lock:
             trace = list(records)
             assert not errors, errors
-        expected_count = 1 if scenario == "text" or (scenario == "limit" and mode != "tui") else 2 if scenario == "limit" else 3
+        expected_count = 1 if scenario in ("text", "limit") else 3
         assert len(trace) == expected_count, (mode, scenario, len(trace), expected_count)
         names = {t["function"]["name"] for t in trace[0].get("tools", [])}
         assert names == (NATIVES | {"bash_exec"}), names
@@ -151,7 +155,7 @@ def run_case(binary, plugins, mode, scenario, root):
             assert "undefined: missingSymbol" in results[1]["content"], results
             assert "Command exited with code 1" in results[1]["content"], results
             system = "\n".join(m["content"] for m in trace[1]["messages"] if m["role"] == "system")
-            assert "Inkwell Diagnostic Alert" not in system, "baseline advice injection changed"
+            assert "Inkwell Diagnostic Alert" in system, "expected Inkwell advice injected on next request"
         if scenario == "multi":
             results = [m["tool_call_id"] for m in trace[2]["messages"] if m["role"] == "tool"]
             assert results == ["first", "failure", "corrected"], results

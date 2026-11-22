@@ -73,9 +73,9 @@ func TestBuiltPluginFailurePropagation(t *testing.T) {
 		if advice := agent.reconciler.Advise(agent.inkwell); advice.InjectPrompt == "" {
 			t.Fatal("failed execution did not produce diagnostic advice")
 		}
-		// C10 known divergence: advice generation is NOT evidence of injection.
-		if len(model.systems) != 2 || strings.Contains(model.systems[1], "Inkwell Diagnostic Alert") {
-			t.Fatal("baseline changed: replace absent diagnostic characterization with injection assertion")
+		// C10: Inkwell advice is now injected into the system prompt for the subsequent round
+		if len(model.systems) != 2 || !strings.Contains(model.systems[1], "Inkwell Diagnostic Alert") {
+			t.Fatalf("streaming=%v: expected Inkwell Diagnostic Alert injected into round 2 system prompt, got: %q", streaming, model.systems)
 		}
 		if len(agent.inkwell) != 1 || !agent.inkwell[0].IsError || agent.inkwell[0].ErrorType == "" {
 			t.Fatalf("Inkwell lost failure: %+v", agent.inkwell)

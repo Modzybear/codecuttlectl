@@ -11,13 +11,23 @@ GOFLAGS := -trimpath
 # Plugin sources
 PLUGINS := $(wildcard plugins/cuttlebone-*)
 
-.PHONY: all build build-plugins clean test lint run test-tui-smoke test-runtime-characterization validate
+.PHONY: all build build-plugins install clean test test-race lint run test-tui-smoke test-runtime-characterization validate
 
 all: build build-plugins
 
 ## build: Compile the codecuttlectl binary
 build:
 	$(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
+
+## install: Atomically build and install codecuttlectl to /usr/local/bin
+install:
+	$(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o /tmp/$(BINARY_NAME).new $(CMD_DIR)
+	@if [ -w /usr/local/bin ]; then \
+		mv /tmp/$(BINARY_NAME).new /usr/local/bin/$(BINARY_NAME); \
+	else \
+		sudo mv /tmp/$(BINARY_NAME).new /usr/local/bin/$(BINARY_NAME); \
+	fi
+	@ls -lh /usr/local/bin/$(BINARY_NAME)
 
 ## build-plugins: Compile all Cuttlebone plugin binaries
 build-plugins: $(PLUGINS)
@@ -35,6 +45,10 @@ run: all
 ## test: Run all unit tests
 test:
 	$(GO) test -v ./...
+
+## test-race: Run all unit tests with the Go race detector
+test-race:
+	$(GO) test -count=1 -race ./...
 
 ## test-tui-smoke: Build a temporary binary and test real terminal input offline
 test-tui-smoke:

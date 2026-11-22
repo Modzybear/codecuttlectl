@@ -116,19 +116,25 @@ func NewAgent(cfg Config) (*Agent, error) {
 		cfg.MaxSteps = 25
 	}
 
-	// Resolve client from pool if not provided directly
-	if cfg.Client == nil && cfg.Pool != nil {
-		if bp, ok := cfg.Pool.(interface{ BedrockPool() *bedrock.ModelPool }); ok {
-			cfg.Client = bp.BedrockPool().Primary()
-		} else if primary := cfg.Pool.Primary(); primary != nil {
-			cfg.Provider = primary
-		}
-	}
-
 	// Phase 2: Compute available Swarm Nodes for the prompt
 	primaryID := cfg.InitialNode
 	if primaryID == "" {
 		primaryID = PrimaryNodeID(cfg.Morph)
+	}
+
+	// Resolve provider from pool for the target node (or primary)
+	if cfg.Client == nil && cfg.Pool != nil {
+		if bp, ok := cfg.Pool.(interface{ BedrockPool() *bedrock.ModelPool }); ok {
+			cfg.Client = bp.BedrockPool().Primary()
+		} else if primaryID != "" {
+			if nodeProv, ok := cfg.Pool.GetNode(primaryID); ok && nodeProv != nil {
+				cfg.Provider = nodeProv
+			} else if primary := cfg.Pool.Primary(); primary != nil {
+				cfg.Provider = primary
+			}
+		} else if primary := cfg.Pool.Primary(); primary != nil {
+			cfg.Provider = primary
+		}
 	}
 	var swarmNodes []string
 	if cfg.Morph != nil {
@@ -346,7 +352,7 @@ func (a *Agent) Turn(ctx context.Context, userMessage string) (string, error) {
 			}
 
 			start := time.Now()
-			result, status := a.executeTool(ctx, toolUse.Name, toolUse.Input)
+			result, status := a.executeTool(ctx, toolUse.Name, toolUse.Input, false)
 			duration := time.Since(start)
 			endTime := time.Now().UTC()
 
@@ -581,7 +587,7 @@ func (a *Agent) StreamTurn(ctx context.Context, userMessage string, cb StreamCal
 		var toolResults []bedrock.ToolResult
 		for _, tc := range toolCalls {
 			start := time.Now()
-			result, status := a.executeTool(ctx, tc.name, tc.input)
+			result, status := a.executeTool(ctx, tc.name, tc.input, false)
 			duration := time.Since(start)
 			endTime := time.Now().UTC()
 
@@ -657,11 +663,53 @@ func jsonToMapAgent(data json.RawMessage) map[string]interface{} {
 // ExecuteTool dispatches a tool call to the appropriate handler.
 // Exported so Engine and TUI can reuse the identical execution logic without duplication.
 func (a *Agent) ExecuteTool(ctx context.Context, name string, input json.RawMessage) (string, types.ToolResultStatus) {
-	return a.executeTool(ctx, name, input)
+	start := time.Now()
+	res, status := a.executeTool(ctx, name, input, false)
+	a.recordExternalToolExec(name, input, res, status, time.Since(start))
+	return res, status
+}
+
+// ExecuteToolApproved dispatches a tool call that has already been approved by an interactive UI.
+// It bypasses the agent's internal approval check while still recording the approval in the audit trail.
+func (a *Agent) ExecuteToolApproved(ctx context.Context, name string, input json.RawMessage) (string, types.ToolResultStatus) {
+	start := time.Now()
+	res, status := a.executeTool(ctx, name, input, true)
+	a.recordExternalToolExec(name, input, res, status, time.Since(start))
+	return res, status
+}
+
+func (a *Agent) recordExternalToolExec(name string, input json.RawMessage, output string, status types.ToolResultStatus, dur time.Duration) {
+	if a == nil {
+		return
+	}
+	isError := (status == types.ToolResultStatusError)
+	errType := string(inkwell.Classify(name, output, isError).Class)
+	durMs := dur.Milliseconds()
+	a.inkwell = append(a.inkwell, session.InkEntry{
+		Timestamp:  time.Now().UTC().Add(-dur),
+		EndTime:    time.Now().UTC(),
+		DurationMs: durMs,
+		Turn:       a.turn,
+		ToolName:   name,
+		Input:      input,
+		Output:     output,
+		IsError:    isError,
+		ErrorType:  errType,
+	})
+	a.recordToolExec(name, "", durMs, isError, errType, a.turn)
+}
+
+// InkwellAdvice returns the current corrective diagnostic prompt from Inkwell
+// when the most recent tool execution failed, or "" if no intervention is needed.
+func (a *Agent) InkwellAdvice() string {
+	if a == nil || a.reconciler == nil || len(a.inkwell) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(a.reconciler.Advise(a.inkwell).InjectPrompt)
 }
 
 // executeTool dispatches a tool call to the appropriate handler.
-func (a *Agent) executeTool(ctx context.Context, name string, input json.RawMessage) (string, types.ToolResultStatus) {
+func (a *Agent) executeTool(ctx context.Context, name string, input json.RawMessage, skipApproval bool) (string, types.ToolResultStatus) {
 	if err := ctx.Err(); err != nil {
 		return fmt.Sprintf("Tool was not executed: %v", err), types.ToolResultStatusError
 	}
@@ -706,7 +754,9 @@ func (a *Agent) executeTool(ctx context.Context, name string, input json.RawMess
 
 	// Approval gate: check if this invocation is destructive
 	if req := approval.Check(name, string(input)); req != nil {
-		if !a.autoApprove {
+		if skipApproval {
+			a.recordApproval(name, req.Risk.String(), "approved")
+		} else if !a.autoApprove {
 			if a.approvalFunc != nil {
 				allowed := a.approvalFunc(name, req.Command, req.Reason, req.Risk.String())
 				if !allowed {

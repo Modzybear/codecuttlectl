@@ -47,7 +47,7 @@ func TestExecuteTool_SandboxEnforcement(t *testing.T) {
 	// Allowed tool (should pass sandbox, but fail further down because we didn't mock pluginMgr.
 	// But let's check a built-in that IS allowed, or just observe the error message.
 	// Actually, if it's rejected by sandbox, we get a specific error string.
-	res, status := agent.executeTool(context.Background(), "bash_exec", json.RawMessage(`{}`))
+	res, status := agent.executeTool(context.Background(), "bash_exec", json.RawMessage(`{}`), false)
 
 	if status != types.ToolResultStatusError {
 		t.Errorf("expected error status for unauthorized tool, got %v", status)
@@ -61,7 +61,7 @@ func TestExecuteTool_SandboxEnforcement(t *testing.T) {
 	// but we just want to ensure it DOESN'T return the sandbox error).
 	// Let's use a built-in tool that is allowed, like "todo_manage", by adding it to workbench.
 	agent.workbench = append(agent.workbench, "todo_manage")
-	res, status = agent.executeTool(context.Background(), "todo_manage", json.RawMessage(`{"todos":[]}`))
+	res, status = agent.executeTool(context.Background(), "todo_manage", json.RawMessage(`{"todos":[]}`), false)
 
 	if strings.Contains(res, "not authorized") {
 		t.Errorf("did not expect sandbox error for authorized tool, got: %v", res)
@@ -411,5 +411,53 @@ func TestAgentHeadlessAutoRolloverMidTurnAndSwarmGuard(t *testing.T) {
 	a.rolloverCtrl.MarkUsageSeen()
 	if a.maybeAutoRollover(context.Background(), true, false) {
 		t.Fatal("non-orchestrator swarm node must never trigger auto-rollover")
+	}
+}
+
+type nodePoolStub struct {
+	provider.Pool
+	primary provider.Provider
+	nodes   map[string]provider.Provider
+}
+
+func (p nodePoolStub) Primary() provider.Provider { return p.primary }
+func (p nodePoolStub) GetNode(id string) (provider.Provider, bool) {
+	prov, ok := p.nodes[id]
+	return prov, ok
+}
+
+func TestNewAgentInitialNodeResolvesTargetProfile(t *testing.T) {
+	leadProv := &scriptedConverseProvider{id: "bedrock:lead"}
+	workerProv := &scriptedConverseProvider{id: "openrouter:google/gemini-4-neon"}
+	pool := nodePoolStub{
+		primary: leadProv,
+		nodes: map[string]provider.Provider{
+			"orchestrator": leadProv,
+			"flash_coder":  workerProv,
+		},
+	}
+	morph := &swarm.Morphology{
+		Nodes: map[string]swarm.Node{
+			"orchestrator": {IsPrimary: true, SystemPrompt: "LEAD_PROMPT", Workbench: []string{"todo_manage", "handoff"}},
+			"flash_coder":  {IsPrimary: false, SystemPrompt: "WORKER_PROMPT", Workbench: []string{"read_file", "edit_file"}},
+		},
+	}
+	a, err := NewAgent(Config{
+		Pool:        pool,
+		Morph:       morph,
+		InitialNode: "flash_coder",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if a.ActiveNode() != "flash_coder" {
+		t.Fatalf("ActiveNode = %q, want flash_coder", a.ActiveNode())
+	}
+	if a.provider != workerProv {
+		t.Fatalf("provider = %v, want workerProv (%s)", a.provider.ID(), workerProv.ID())
+	}
+	if !IsToolAllowed("read_file", a.Workbench()) || IsToolAllowed("todo_manage", a.Workbench()) {
+		t.Fatalf("unexpected worker workbench: %v", a.Workbench())
 	}
 }

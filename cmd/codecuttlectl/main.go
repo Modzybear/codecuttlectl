@@ -472,6 +472,7 @@ func main() {
 		Morph:          morph,
 		Agent:          agent,
 		Engine:         engine,
+		MaxSteps:       *maxSteps,
 		RolloverConfig: &rolloverCfg,
 	})
 

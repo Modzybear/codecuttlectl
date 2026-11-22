@@ -30,7 +30,7 @@ func TestBuiltinOutcomes(t *testing.T) {
 	} {
 		t.Run(tc.name+tc.input, func(t *testing.T) {
 			agent := &Agent{pluginMgr: pluginhost.NewManager(false), todos: todo.NewList(), morph: &swarm.Morphology{Nodes: map[string]swarm.Node{"primary": {IsPrimary: true}}}}
-			output, status := agent.executeTool(context.Background(), tc.name, json.RawMessage(tc.input))
+			output, status := agent.executeTool(context.Background(), tc.name, json.RawMessage(tc.input), false)
 			if (status == types.ToolResultStatusError) != tc.failed {
 				t.Fatalf("status=%s want error=%v; output=%s", status, tc.failed, output)
 			}

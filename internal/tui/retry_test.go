@@ -188,3 +188,48 @@ func TestMalformedErrorAndEmptyResponseInTUI(t *testing.T) {
 		t.Fatalf("empty response diagnostic not rendered: %+v", m.messages)
 	}
 }
+
+func TestTransientConnectionResetStreamAutoRetriesInTUI(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		n := attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			// Emit partial text then abrupt EOF (simulating mid-stream connection drop)
+			fmt.Fprint(w, sse(`{"choices":[{"delta":{"content":"partial discarded "}}]}`))
+			return
+		}
+		fmt.Fprint(w, sse(
+			`{"choices":[{"delta":{"content":"recovered response"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		))
+	}))
+	defer server.Close()
+
+	m := New(Config{PluginMgr: pluginhost.NewManager(false)})
+	m.llmProvider = openrouter.New(openrouter.Config{BaseURL: server.URL})
+	m.submitMessage("hello")
+	defer m.stopModelStream()
+
+	// Drain attempt 1 (partial text followed by unexpected EOF -> StreamErrorMsg triggers auto-retry)
+	for i := 0; i < 20 && m.streaming; i++ {
+		if m.streamCh == nil {
+			break
+		}
+		ev := m.readNextStreamEvent()()
+		updated, _ := m.Update(ev)
+		m = updated.(Model)
+	}
+
+	if attempts.Load() != 2 {
+		t.Fatalf("expected 2 attempts after transient stream drop, got %d", attempts.Load())
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].content != "recovered response" {
+		t.Fatalf("expected clean 'recovered response' without partial prefix, got %+v", m.messages)
+	}
+}

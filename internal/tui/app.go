@@ -51,6 +51,7 @@ type Config struct {
 	Morph          *swarm.Morphology // Pass down morph config
 	Agent          *conversation.Agent
 	Engine         *conversation.Engine
+	MaxSteps       int              // Max consecutive tool steps per turn (default: 0 = unlimited/agent default)
 	RolloverConfig *rollover.Config // Optional epoch rollover config (nil = DefaultConfig)
 }
 
@@ -92,6 +93,8 @@ type Model struct {
 	stateDict         *stateDict    // State dictionary for small-model grounding (nil for large models)
 	lastExecutedTools []pendingTool // Tools from the last execution (for state dict tracking)
 	autoNudgeCount    int           // Number of auto-nudges in this turn (capped to prevent infinite loops)
+	maxSteps          int           // Maximum consecutive tool steps per turn (0 = unlimited)
+	turnSteps         int           // Count of tool execution steps in the current user turn
 
 	// Interrupt state
 	interruptPending bool // true when user pressed esc once, waiting for confirmation
@@ -107,18 +110,21 @@ type Model struct {
 	currentToolID    string
 	currentToolName  string
 	currentToolInput *strings.Builder
-	currentToolSig   string // ThoughtSignature for current tool being streamed
-	pendingToolCalls []pendingTool
+	currentToolSig      string // ThoughtSignature for current tool being streamed
+	pendingToolCalls    []pendingTool
+	streamServerRetries int // Transient network/server retry counter for the active stream round
 
 	// Active tool execution streaming state
 	activeToolName   string           // Name of currently executing tool
 	activeToolOutput *strings.Builder // Rolling output buffer for live preview
 
 	// Approval gate state
-	approvalPending   *approval.Request // Non-nil when awaiting user approval
-	approvalTool      *pendingTool      // The tool awaiting approval
-	approvalRemaining []pendingTool     // Tools queued behind the approval gate
-	autoApprove       bool              // When true, skip confirmation prompts
+	approvalPending          *approval.Request // Non-nil when awaiting user approval
+	approvalTool             *pendingTool      // The tool awaiting approval
+	approvalRemaining        []pendingTool     // Tools queued behind the approval gate
+	approvalCompletedResults []provider.ToolResultBlock
+	approvalCompletedTodos   []json.RawMessage
+	autoApprove              bool // When true, skip confirmation prompts
 
 	// Todo state
 	todos        *todo.List
@@ -269,6 +275,7 @@ func New(cfg Config) Model {
 		workDir:          cfg.WorkDir,
 		enableThinking:   cfg.EnableThinking,
 		thinkingBudget:   thinkingBudget,
+		maxSteps:         cfg.MaxSteps,
 		todos:            todo.NewList(),
 		messages:         []chatMessage{},
 		streamBuf:        &strings.Builder{},
@@ -755,6 +762,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamDoneMsg:
 		m.stopModelStream()
+		m.streamServerRetries = 0
 		// If we have pending tool calls, build a single assistant message
 		// containing any text AND the tool_use blocks, then execute tools.
 		if len(m.pendingToolCalls) > 0 {
@@ -949,6 +957,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamErrorMsg:
 		m.stopModelStream()
+		if (m.llmProvider != nil || m.client != nil) &&
+			provider.IsTransientStreamError(msg.Err) &&
+			m.streamServerRetries < 3 {
+			m.streamServerRetries++
+			m.streamBuf.Reset()
+			m.reasoningBuf.Reset()
+			m.reasoningDetails = nil
+			m.pendingToolCalls = nil
+			m.currentToolInput.Reset()
+			m.currentToolID = ""
+			m.currentToolName = ""
+			m.currentToolSig = ""
+			m.inReasoning = false
+			m.retryReason = fmt.Sprintf("Transient network error: retry %d/3", m.streamServerRetries)
+			m.updateViewportContent()
+			return m, m.launchStream()
+		}
+		m.streamServerRetries = 0
 		m.streaming = false
 		m.streamCh = nil
 		if m.rolloverState == rollover.StateCloseout {
@@ -994,19 +1020,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Store the tool awaiting approval
 		m.approvalTool = &pendingTool{
-			id:    msg.ToolUseID,
-			name:  msg.ToolName,
-			input: msg.Input,
+			id:               msg.ToolUseID,
+			name:             msg.ToolName,
+			input:            msg.Input,
+			thoughtSignature: msg.ThoughtSignature,
 		}
 		// Convert remaining tools back to pendingTool for later execution
 		m.approvalRemaining = nil
 		for _, rt := range msg.RemainingTools {
 			m.approvalRemaining = append(m.approvalRemaining, pendingTool{
-				id:    rt.ID,
-				name:  rt.Name,
-				input: rt.Input,
+				id:               rt.ID,
+				name:             rt.Name,
+				input:            rt.Input,
+				thoughtSignature: rt.ThoughtSignature,
 			})
 		}
+		m.approvalCompletedResults = append([]provider.ToolResultBlock(nil), msg.CompletedResults...)
+		m.approvalCompletedTodos = append([]json.RawMessage(nil), msg.CompletedTodos...)
 		m.messages = append(m.messages, chatMessage{
 			role:    "tool_call",
 			content: fmt.Sprintf("⚠️  APPROVAL REQUIRED (%s risk)\n   Tool: %s\n   Command: %s\n   Reason: %s\n\n   Press 'y' to approve, 'n' to deny", msg.Risk, msg.ToolName, msg.Command, msg.Reason),
@@ -1018,6 +1048,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ApprovalDecisionMsg:
 		// User made a decision on the pending approval.
 		m.approvalPending = nil
+		tool := m.approvalTool
+		m.approvalTool = nil
+		remaining := m.approvalRemaining
+		m.approvalRemaining = nil
+		completedResults := m.approvalCompletedResults
+		m.approvalCompletedResults = nil
+		completedTodos := m.approvalCompletedTodos
+		m.approvalCompletedTodos = nil
+
 		if msg.Approved {
 			// Execute the approved tool
 			m.messages = append(m.messages, chatMessage{
@@ -1025,11 +1064,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content: "✓ Approved — executing...",
 			})
 			m.updateViewportContent()
-			tool := m.approvalTool
-			m.approvalTool = nil
-			remaining := m.approvalRemaining
-			m.approvalRemaining = nil
-			return m, m.executeApprovedTool(tool, remaining)
+			return m, m.executeApprovedTool(tool, remaining, completedResults, completedTodos)
 		}
 		// Denied — return a tool error to the model
 		m.messages = append(m.messages, chatMessage{
@@ -1038,12 +1073,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			isError: true,
 		})
 		m.updateViewportContent()
-		tool := m.approvalTool
-		m.approvalTool = nil
-		remaining := m.approvalRemaining
-		m.approvalRemaining = nil
 		// Build result for the denied tool and execute remaining tools normally
-		return m, m.executeDeniedToolAndRemaining(tool, remaining)
+		return m, m.executeDeniedToolAndRemaining(tool, remaining, completedResults, completedTodos)
 
 	case ContinueStreamMsg:
 		// Process any todo updates safely in the Update handler (single-threaded)
@@ -1056,7 +1087,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				input := msg.TodoInputs[todoIdx]
 				todoIdx++
-				if err := json.Unmarshal(input, &payload); err != nil {
+				if !conversation.IsToolAllowed("todo_manage", m.activeWorkbench()) {
+					msg.Messages[i].Content = fmt.Sprintf("Error: Tool \"todo_manage\" is not authorized in this node's workbench. Allowed tools: %v", m.activeWorkbench())
+					msg.Messages[i].IsError = true
+				} else if err := json.Unmarshal(input, &payload); err != nil {
 					msg.Messages[i].Content = fmt.Sprintf("Error parsing todo input: %v", err)
 					msg.Messages[i].IsError = true
 				} else {
@@ -1257,8 +1291,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.abortRollover(fmt.Sprintf("Rollover aborted: closeout exceeded %d steps without a valid save_checkpoint — staying in Epoch %d.", m.rolloverCloseoutMaxSteps, m.effectiveEpoch()))
 				return m, nil
 			}
-		} else if cmd, triggered := m.maybeAutoRollover(false); triggered {
-			return m, cmd
+		} else {
+			m.turnSteps++
+			if m.maxSteps > 0 && m.turnSteps >= m.maxSteps {
+				m.streaming = false
+				m.streamCh = nil
+				m.messages = append(m.messages, chatMessage{
+					role:    "assistant",
+					content: fmt.Sprintf("Error: exceeded maximum steps (%d) without completing", m.maxSteps),
+					isError: true,
+				})
+				m.saveSession()
+				m.updateViewportContent()
+				return m, nil
+			}
+			if cmd, triggered := m.maybeAutoRollover(false); triggered {
+				return m, cmd
+			}
 		}
 		m.streamStep++ // Track consecutive tool-use rounds for grounding
 
@@ -1506,6 +1555,11 @@ func (m *Model) launchStream() tea.Cmd {
 	if m.rolloverState == rollover.StateArmed && m.rolloverArmedCtxPct > 0 {
 		effectiveSystem += "\n\n" + rollover.ArmedSystemHint(m.rolloverArmedCtxPct)
 	}
+	if m.agent != nil {
+		if advice := m.agent.InkwellAdvice(); advice != "" {
+			effectiveSystem += "\n\n" + advice
+		}
+	}
 
 	// Use the provider interface for streaming
 	if m.llmProvider != nil {
@@ -1720,6 +1774,8 @@ func (m *Model) submitMessage(text string) tea.Cmd {
 
 	m.messages = append(m.messages, chatMessage{role: "user", content: text})
 	m.totalTurns++
+	m.turnSteps = 0
+	m.streamServerRetries = 0
 	m.history = append(m.history, m.stampMessage(provider.BuildUserTextMessage(text)))
 	m.viewport.SetContent(m.renderMessages())
 	m.viewport.GotoBottom()
@@ -1743,15 +1799,21 @@ func (m *Model) submitMessage(text string) tea.Cmd {
 func (m *Model) executePendingTools() tea.Cmd {
 	tools := m.pendingToolCalls
 	m.pendingToolCalls = nil
+	return m.executeToolBatch(nil, nil, tools)
+}
+
+// executeToolBatch executes a list of pending tools while preserving prior results and todo inputs.
+func (m *Model) executeToolBatch(priorResults []provider.ToolResultBlock, priorTodos []json.RawMessage, tools []pendingTool) tea.Cmd {
 	pluginMgr := m.pluginMgr
 	workDir := m.workDir
 	autoApprove := m.autoApprove
 	inCloseout := m.rolloverState == rollover.StateCloseout
 	allowDocWrites := m.rolloverDocsAllowed
+	activeWorkbench := m.activeWorkbench()
 
 	return func() tea.Msg {
-		var results []provider.ToolResultBlock
-		var todoInputs []json.RawMessage
+		results := append([]provider.ToolResultBlock(nil), priorResults...)
+		todoInputs := append([]json.RawMessage(nil), priorTodos...)
 		var checkpointPayload *session.CheckpointPayload
 		ctx := context.Background()
 
@@ -1791,10 +1853,6 @@ func (m *Model) executePendingTools() tea.Cmd {
 			}
 
 			// Security Gate: Check workbench authorization before executing or queuing
-			var activeWorkbench []string
-			if m.agent != nil {
-				activeWorkbench = m.agent.Workbench()
-			}
 			if activeWorkbench != nil && !conversation.IsToolAllowed(tool.name, activeWorkbench) {
 				results = append(results, provider.ToolResultBlock{
 					ToolUseID: tool.id,
@@ -1887,117 +1945,63 @@ func (m *Model) executePendingTools() tea.Cmd {
 }
 
 // executeApprovedTool runs the approved tool and then continues with the remaining tools.
-func (m *Model) executeApprovedTool(tool *pendingTool, remaining []pendingTool) tea.Cmd {
+func (m *Model) executeApprovedTool(tool *pendingTool, remaining []pendingTool, priorResults []provider.ToolResultBlock, priorTodos []json.RawMessage) tea.Cmd {
 	pluginMgr := m.pluginMgr
 	workDir := m.workDir
-	autoApprove := m.autoApprove
+	activeWorkbench := m.activeWorkbench()
 
 	return func() tea.Msg {
 		ctx := context.Background()
-		var results []provider.ToolResultBlock
-		var todoInputs []json.RawMessage
+		results := append([]provider.ToolResultBlock(nil), priorResults...)
+		todoInputs := append([]json.RawMessage(nil), priorTodos...)
 
-		// Execute the approved tool via Agent if present
-		var output string
-		var status bool
-		if m.agent != nil {
-			res, st := m.agent.ExecuteTool(ctx, tool.name, tool.input)
-			output = res
-			status = (st == types.ToolResultStatusError)
+		if activeWorkbench != nil && !conversation.IsToolAllowed(tool.name, activeWorkbench) {
+			results = append(results, provider.ToolResultBlock{
+				ToolUseID: tool.id,
+				Name:      tool.name,
+				Content:   fmt.Sprintf("Error: Tool %q is not authorized in this node's workbench. Allowed tools: %v", tool.name, activeWorkbench),
+				IsError:   true,
+			})
 		} else {
-			res, err := pluginMgr.Execute(ctx, tool.name, tool.input, workDir)
-			if err != nil {
-				if res == "" {
-					res = fmt.Sprintf("Error: %s", err.Error())
-				}
-				status = true
-			}
-			output = res
-		}
-		results = append(results, provider.ToolResultBlock{
-			ToolUseID: tool.id,
-			Name:      tool.name,
-			Content:   output,
-			IsError:   status,
-		})
-
-		// Execute remaining tools (they may also need approval)
-		for i, rt := range remaining {
-			if rt.name == "todo_manage" {
-				todoInputs = append(todoInputs, rt.input)
-				results = append(results, provider.ToolResultBlock{
-					ToolUseID: rt.id,
-					Name:      rt.name,
-					Content:   "",
-					IsError:   false,
-				})
-				continue
-			}
-
-			if req := approval.Check(rt.name, string(rt.input)); req != nil {
-				req.ToolUseID = rt.id
-				if !autoApprove {
-					var furtherRemaining []pendingToolForApproval
-					for _, fr := range remaining[i+1:] {
-						furtherRemaining = append(furtherRemaining, pendingToolForApproval{
-							ID:    fr.id,
-							Name:  fr.name,
-							Input: fr.input,
-						})
-					}
-					return ApprovalRequestMsg{
-						ToolIndex:        i,
-						ToolName:         rt.name,
-						ToolUseID:        rt.id,
-						Input:            rt.input,
-						Command:          req.Command,
-						Reason:           req.Reason,
-						Risk:             req.Risk.String(),
-						CompletedResults: results,
-						CompletedTodos:   todoInputs,
-						RemainingTools:   furtherRemaining,
-					}
-				}
-			}
-
-			var rtOutput string
-			var rtStatus bool
+			// Execute the approved tool via Agent (bypassing internal approval check) or plugin manager
+			var output string
+			var isErr bool
 			if m.agent != nil {
-				res, st := m.agent.ExecuteTool(ctx, rt.name, rt.input)
-				rtOutput = res
-				rtStatus = (st == types.ToolResultStatusError)
+				res, st := m.agent.ExecuteToolApproved(ctx, tool.name, tool.input)
+				output = res
+				isErr = (st == types.ToolResultStatusError)
 			} else {
-				res, rtErr := pluginMgr.Execute(ctx, rt.name, rt.input, workDir)
-				if rtErr != nil {
+				res, err := pluginMgr.Execute(ctx, tool.name, tool.input, workDir)
+				if err != nil {
 					if res == "" {
-						res = fmt.Sprintf("Error: %s", rtErr.Error())
+						res = fmt.Sprintf("Error: %s", err.Error())
 					}
-					rtStatus = true
+					isErr = true
 				}
-				rtOutput = res
+				output = res
 			}
 			results = append(results, provider.ToolResultBlock{
-				ToolUseID: rt.id,
-				Name:      rt.name,
-				Content:   rtOutput,
-				IsError:   rtStatus,
+				ToolUseID: tool.id,
+				Name:      tool.name,
+				Content:   output,
+				IsError:   isErr,
 			})
 		}
 
-		return ContinueStreamMsg{Messages: results, TodoInputs: todoInputs}
+		if len(remaining) == 0 {
+			return ContinueStreamMsg{Messages: results, TodoInputs: todoInputs}
+		}
+
+		cmd := m.executeToolBatch(results, todoInputs, remaining)
+		return cmd()
 	}
 }
 
 // executeDeniedToolAndRemaining returns a denial result for the tool and continues with remaining.
-func (m *Model) executeDeniedToolAndRemaining(tool *pendingTool, remaining []pendingTool) tea.Cmd {
-	pluginMgr := m.pluginMgr
-	workDir := m.workDir
-	autoApprove := m.autoApprove
-
+func (m *Model) executeDeniedToolAndRemaining(tool *pendingTool, remaining []pendingTool, priorResults []provider.ToolResultBlock, priorTodos []json.RawMessage) tea.Cmd {
 	return func() tea.Msg {
-		ctx := context.Background()
-		var results []provider.ToolResultBlock
-		var todoInputs []json.RawMessage
+		results := append([]provider.ToolResultBlock(nil), priorResults...)
+		todoInputs := append([]json.RawMessage(nil), priorTodos...)
 
 		// Denied tool gets an error result
 		results = append(results, provider.ToolResultBlock{
@@ -2007,62 +2011,12 @@ func (m *Model) executeDeniedToolAndRemaining(tool *pendingTool, remaining []pen
 			IsError:   true,
 		})
 
-		// Execute remaining tools normally
-		for i, rt := range remaining {
-			if rt.name == "todo_manage" {
-				todoInputs = append(todoInputs, rt.input)
-				results = append(results, provider.ToolResultBlock{
-					ToolUseID: rt.id,
-					Name:      rt.name,
-					Content:   "",
-					IsError:   false,
-				})
-				continue
-			}
-
-			if req := approval.Check(rt.name, string(rt.input)); req != nil {
-				req.ToolUseID = rt.id
-				if !autoApprove {
-					var furtherRemaining []pendingToolForApproval
-					for _, fr := range remaining[i+1:] {
-						furtherRemaining = append(furtherRemaining, pendingToolForApproval{
-							ID:    fr.id,
-							Name:  fr.name,
-							Input: fr.input,
-						})
-					}
-					return ApprovalRequestMsg{
-						ToolIndex:        i,
-						ToolName:         rt.name,
-						ToolUseID:        rt.id,
-						Input:            rt.input,
-						Command:          req.Command,
-						Reason:           req.Reason,
-						Risk:             req.Risk.String(),
-						CompletedResults: results,
-						CompletedTodos:   todoInputs,
-						RemainingTools:   furtherRemaining,
-					}
-				}
-			}
-
-			rtOutput, rtErr := pluginMgr.Execute(ctx, rt.name, rt.input, workDir)
-			rtStatus := false
-			if rtErr != nil {
-				if rtOutput == "" {
-					rtOutput = fmt.Sprintf("Error: %s", rtErr.Error())
-				}
-				rtStatus = true
-			}
-			results = append(results, provider.ToolResultBlock{
-				ToolUseID: rt.id,
-				Name:      rt.name,
-				Content:   rtOutput,
-				IsError:   rtStatus,
-			})
+		if len(remaining) == 0 {
+			return ContinueStreamMsg{Messages: results, TodoInputs: todoInputs}
 		}
 
-		return ContinueStreamMsg{Messages: results, TodoInputs: todoInputs}
+		cmd := m.executeToolBatch(results, todoInputs, remaining)
+		return cmd()
 	}
 }
 
@@ -2840,21 +2794,41 @@ func sanitizeModelText(text string) string {
 	return cleaned
 }
 
+// activeWorkbench returns the effective workbench whitelist for the current TUI state.
+func (m *Model) activeWorkbench() []string {
+	if m.agent != nil && m.agent.Workbench() != nil {
+		return m.agent.Workbench()
+	}
+	if m.morph != nil {
+		activeNode := m.activeNodeID()
+		if activeNode != "" {
+			if node, ok := m.morph.Nodes[activeNode]; ok {
+				return node.Workbench
+			}
+		}
+		if m.pool != nil {
+			for name, node := range m.morph.Nodes {
+				if prov, ok := m.pool.GetNode(name); ok && prov == m.llmProvider {
+					return node.Workbench
+				}
+			}
+		}
+		if primaryID := conversation.PrimaryNodeID(m.morph); primaryID != "" {
+			if primary, ok := m.morph.Nodes[primaryID]; ok {
+				return primary.Workbench
+			}
+		}
+	}
+	return nil
+}
+
 // providerToolDefs returns tool definitions in provider-agnostic format.
 func (m *Model) providerToolDefs() []provider.ToolDefinition {
 	defs := m.pluginMgr.Definitions()
 	var result []provider.ToolDefinition
 
-	// If using Swarm Morphologies, filter plugins by active node's sandbox
-	var activeWorkbench []string
-	if m.morph != nil && m.system != "" {
-		for name, node := range m.morph.Nodes {
-			if prov, ok := m.pool.GetNode(name); ok && prov == m.llmProvider {
-				activeWorkbench = node.Workbench
-				break
-			}
-		}
-	}
+	// Filter plugins by active node's sandbox
+	activeWorkbench := m.activeWorkbench()
 
 	for _, d := range defs {
 		if activeWorkbench != nil && !conversation.IsToolAllowed(d.Name, activeWorkbench) {
@@ -3425,6 +3399,7 @@ func (m *Model) commitEpochRollover(payload session.CheckpointPayload) tea.Cmd {
 	m.epochs = append(m.epochs, checkpoint)
 	m.currentEpoch = nextEpoch
 	m.msgSeq = 0
+	m.turnSteps = 0
 	m.lastCallInputTokens = 0
 	m.lastCallCacheReadInputTokens = 0
 	m.lastCallCacheWriteInputTokens = 0

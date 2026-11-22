@@ -49,6 +49,9 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		if hint := a.armedSystemHint(); hint != "" {
 			effectivePrompt += "\n\n" + hint
 		}
+		if advice := a.InkwellAdvice(); advice != "" {
+			effectivePrompt += "\n\n" + advice
+		}
 
 		req := provider.Request{
 			System:   effectivePrompt,
@@ -110,6 +113,7 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 		a.maybeUpdatePlanFromText(resp.Content)
 
 		// Execute tool calls and collect results
+		prevProvider := a.provider
 		var resultBlocks []provider.ContentBlock
 		for _, toolUse := range resp.ToolUses {
 			if a.verbose {
@@ -124,7 +128,7 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 			}
 
 			start := time.Now()
-			result, status := a.executeTool(ctx, toolUse.Name, toolUse.Input)
+			result, status := a.executeTool(ctx, toolUse.Name, toolUse.Input, false)
 			duration := time.Since(start)
 			endTime := time.Now().UTC()
 
@@ -178,6 +182,9 @@ func (a *Agent) turnProvider(ctx context.Context, userMessage string) (string, e
 			Role:    provider.RoleUser,
 			Content: resultBlocks,
 		}))
+		if a.provider != prevProvider && a.provider != nil {
+			a.provHistory = provider.SanitizeHistoryForProvider(a.provHistory, provider.EffectiveID(a.provider))
+		}
 		a.dirty = true
 
 		// Compact old tool results to bound context growth across long tool chains.
@@ -228,6 +235,9 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		}
 		if hint := a.armedSystemHint(); hint != "" {
 			effectivePrompt += "\n\n" + hint
+		}
+		if advice := a.InkwellAdvice(); advice != "" {
+			effectivePrompt += "\n\n" + advice
 		}
 
 		req := provider.Request{
@@ -418,10 +428,11 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 		}
 
 		// Execute tool calls
+		prevProvider := a.provider
 		var resultBlocks []provider.ContentBlock
 		for _, tc := range toolCalls {
 			start := time.Now()
-			result, status := a.executeTool(ctx, tc.name, tc.input)
+			result, status := a.executeTool(ctx, tc.name, tc.input, false)
 			duration := time.Since(start)
 			endTime := time.Now().UTC()
 
@@ -478,6 +489,9 @@ func (a *Agent) streamTurnProvider(ctx context.Context, userMessage string, cb S
 			Role:    provider.RoleUser,
 			Content: resultBlocks,
 		}))
+		if a.provider != prevProvider && a.provider != nil {
+			a.provHistory = provider.SanitizeHistoryForProvider(a.provHistory, provider.EffectiveID(a.provider))
+		}
 		a.dirty = true
 
 		// Compact old tool results to bound context growth across long tool chains.
